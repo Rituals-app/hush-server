@@ -596,6 +596,10 @@ func (h *MessageHandler) handleMLSAddRequest(c *Client, raw []byte) {
 		sendError(c, "bad_request", "channel_id required")
 		return
 	}
+	if clientFrameRequestsRemove(raw) {
+		sendError(c, "forbidden", "remove requests are server-generated")
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), handlerTimeout)
 	defer cancel()

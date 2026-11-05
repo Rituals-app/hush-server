@@ -81,7 +81,9 @@ func (h *channelsHandler) createChannel(w http.ResponseWriter, r *http.Request) 
 	// instead of EncryptedMetadata. Wrap it as a JSON blob so the client can
 	// read it back without a decryption key.
 	if len(req.EncryptedMetadata) == 0 && req.Name != "" {
-		req.EncryptedMetadata = []byte(`{"n":"` + req.Name + `","d":""}`)
+		// Rituals fork: json.Marshal instead of string concatenation, so a
+		// name containing `"` or `\` still yields valid JSON.
+		req.EncryptedMetadata = plaintextMetadata(req.Name)
 	}
 	if req.Type != "text" && req.Type != "voice" && req.Type != "category" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "type must be text, voice, or category"})

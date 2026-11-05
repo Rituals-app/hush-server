@@ -112,6 +112,9 @@ func (h *discoverHandler) createOrFindDM(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cannot create a DM with yourself"})
 		return
 	}
+	if !ritualsAllowDM(w, r, callerID, req.OtherUserID) {
+		return
+	}
 
 	// Verify the other user exists.
 	otherUser, err := h.store.GetUserByID(r.Context(), req.OtherUserID)
@@ -197,6 +200,9 @@ func (h *discoverHandler) searchUsers(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "query must be at least 2 characters",
 		})
+		return
+	}
+	if ritualsSearchUsers(w, r, q, searchUsersLimit) {
 		return
 	}
 

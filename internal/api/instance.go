@@ -83,6 +83,9 @@ func (h *instanceHandler) getConfig(w http.ResponseWriter, r *http.Request) {
 // This stub is intentionally absent; see admin.go.
 
 func (h *instanceHandler) listMembers(w http.ResponseWriter, r *http.Request) {
+	if !ritualsRequireInstanceAdmin(w, r, h.store) {
+		return
+	}
 	members, err := h.store.ListMembers(r.Context())
 	if err != nil {
 		slog.Error("list members", "err", err)
