@@ -358,6 +358,36 @@ func TestRitualsTextCommitCASDB(t *testing.T) {
 	}
 	hub.take()
 
+	// Review M1: the shape an old client's Remove leaves behind (info label 2
+	// on bytes at epoch 3, commit labelled 2). A new-web join sends
+	// parentEpoch = the label (2), epoch 3, framed at the bytes' epoch 3: it
+	// is accepted at 4 and its info heals the row; a retry is not needed.
+	if _, err := pool.Exec(ctx, `DELETE FROM mls_commits WHERE channel_id = $1`, s.textCh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE mls_group_info SET epoch = 2 WHERE channel_id = $1 AND group_type = 'text'`, s.textCh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO mls_commits (channel_id, epoch, commit_bytes, sender_id, ciphersuite)
+		VALUES ($1, 2, $2, $3, $4)`, s.textCh, ritualsTestCommit(2, 16, 1, 2), s.alice, suite); err != nil {
+		t.Fatal(err)
+	}
+	// A framing behind parentEpoch stays malformed.
+	expect(post(s.bob, body{"commitBytes": b64(ritualsTestCommit(1, 16, 1, 3)), "groupInfo": gi, "epoch": 5, "parentEpoch": 4, "ciphersuite": suite}), 400, "parent_epoch_mismatch")
+	expect(post(s.bob, body{"commitBytes": b64(ritualsTestCommit(1, 16, 1, 3)), "groupInfo": gi, "epoch": 3, "parentEpoch": 2, "ciphersuite": suite}), 204, "")
+	if info, commits, n := head(); info != 4 || commits != 4 || n != 2 {
+		t.Fatalf("legacy mislabel join: info=%d commits=%d n=%d, want 4 4 2", info, commits, n)
+	}
+	if f := hub.take(); len(f) != 1 || f[0]["epoch"] != float64(4) {
+		t.Fatalf("legacy mislabel join broadcast %v", f)
+	}
+	// The healed row serves the next member commit normally.
+	expect(post(s.alice, body{"commitBytes": b64(ritualsTestCommit(2, 16, 1, 4)), "groupInfo": gi, "epoch": 5, "parentEpoch": 4, "ciphersuite": suite}), 204, "")
+	if info, commits, _ := head(); info != 5 || commits != 5 {
+		t.Fatalf("after healed commit: info=%d commits=%d", info, commits)
+	}
+	hub.take()
+
 	// Concurrent racers on the same builtOn: exactly one 204, the rest 409.
 	const racers = 8
 	var wg sync.WaitGroup

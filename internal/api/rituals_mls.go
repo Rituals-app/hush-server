@@ -181,7 +181,12 @@ func (rt *ritualsRuntime) postTextCommit(w http.ResponseWriter, r *http.Request,
 	var builtOn int64
 	switch {
 	case ok:
-		if req.ParentEpoch != nil && *req.ParentEpoch != parsed {
+		// The framing is authoritative; parentEpoch is only a floor. A join
+		// sends parentEpoch = the stored info label, and an old client's
+		// Remove left label N on bytes at N+1, so the framing may be ahead
+		// of parentEpoch: that join is accepted at framing+1 and its info
+		// heals the row (review M1). A framing behind parentEpoch is malformed.
+		if req.ParentEpoch != nil && parsed < *req.ParentEpoch {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "parent_epoch_mismatch"})
 			return true
 		}
@@ -195,7 +200,14 @@ func (rt *ritualsRuntime) postTextCommit(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "group_info_required"})
 		return true
 	}
-	if builtOn < 0 || builtOn > math.MaxInt64-1 || (req.Epoch != builtOn && req.Epoch != builtOn+1) {
+	// req.Epoch is checked against what the client says it built on
+	// (parentEpoch+1 for a new client), and the label comes from builtOn.
+	claimed := builtOn
+	if req.ParentEpoch != nil {
+		claimed = *req.ParentEpoch
+	}
+	if builtOn < 0 || builtOn > math.MaxInt64-1 || claimed < 0 || claimed > math.MaxInt64-1 ||
+		(req.Epoch != claimed && req.Epoch != claimed+1) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_epoch"})
 		return true
 	}
