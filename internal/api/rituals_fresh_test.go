@@ -102,3 +102,14 @@ func TestRitualsVerifyFresh(t *testing.T) {
 		t.Fatalf("64 pairs: %v", verr)
 	}
 }
+
+// The worked example of LANE-EF-WIRE Item 5 (computed independently with
+// printf | shasum -a 256): tag, NUL, the uuid::text of the message id.
+func TestRitualsMarkVector(t *testing.T) {
+	if got := ritualsMark("3f2b8c1e-9d4a-4c6b-8e21-7a5d0f9b1c34"); got != "7d9c5df6d051f79aa0d12f8fc2f5b1cb" {
+		t.Fatalf("mark = %s", got)
+	}
+	if got := ritualsMark("3f2b8c1e-9d4a-4c6b-8e21-7a5d0f9b1c35"); len(got) != 32 || got == "7d9c5df6d051f79aa0d12f8fc2f5b1cb" {
+		t.Fatalf("neighbour mark = %s", got)
+	}
+}

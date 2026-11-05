@@ -3,57 +3,83 @@ package api
 // Rituals fork: POST /api/rituals/spaces/fresh {"token":"rtf1..."}.
 //
 // Server to server from the Rituals API: the signed token is the auth, as for
-// /spaces/sync. Rituals learns one content-free boolean per (sp, sub) pair:
-// is there a text message, from someone other than that person, newer than
-// what that person has read, in that space? Never a count, never who, never
-// what. 200 {"fresh":[bool, ...]} in input order; 400 bad_fresh,
-// 403 fresh_expired.
+// /spaces/sync. Rituals learns one content-free mark per (sp, sub) pair: an
+// opaque 32-hex digest of the newest text message in that space that someone
+// other than that person sent, or "". Rituals compares it with the mark it
+// stored when that person last opened the Space (its own "seen" record), so
+// no read state, timestamp, sender or count ever leaves this server.
+// 200 {"marks":[string, ...]} in input order; 400 bad_fresh, 403 fresh_expired,
+// 500 fresh_failed.
 //
 // Per pair, U = every Hush user seated under (sp, sub) in rituals.seats (one
-// per device until device linking lands). fresh = EXISTS a message in a
-// type='text' channel of the space whose recipient_id is NULL or in U, whose
-// sender_id is NULL (a federated sender: someone else) or not in U, and whose
-// "timestamp" is after MAX(read_markers.read_up_to_ts) over U for that channel
-// (no marker: any such message counts). An unknown space or an unclaimed
-// (sp, sub) pair is false. Rate limiting: its own per-IP bucket (5/s, burst
-// 60), outside the global limiter like /spaces/sync; the Rituals API caches,
-// coalesces and caps its own calls (4 reads a second).
+// per device identity). The newest qualifying message is the row with the
+// largest ("timestamp", id) in a type='text' channel of the space whose
+// recipient_id is NULL or in U and whose sender_id is NULL (a federated
+// sender: someone else) or not in U. System messages live in system_messages
+// and never count. mark = lowercase hex(SHA-256("rituals-space-mark-v1" ||
+// 0x00 || m.id::text))[0:32]. An unknown space, an unclaimed (sp, sub) pair or
+// no qualifying message gives "". Rate limiting: its own per-IP bucket (5/s,
+// burst 60), outside the global limiter like /spaces/sync; the Rituals API
+// caches, coalesces and caps its own calls.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 )
 
-const ritualsFreshBodyLimit = 16 << 10
+const (
+	ritualsFreshBodyLimit = 16 << 10
+	ritualsMarkTag        = "rituals-space-mark-v1"
+	ritualsMarkHexLen     = 32
+)
 
 // ritualsFreshSQL is one parameterised statement bounded by the 64-pair limit.
-// Columns (migrations 000001, 000002, 000007, 000010, 000023, 000030):
-// channels(id, server_id, type), messages(channel_id, sender_id NULLable,
-// recipient_id NULLable, "timestamp"), read_markers(channel_id, user_id,
-// read_up_to_ts NULLable); rituals.spaces(sp, server_id) and
-// rituals.seats(sp, sub, user_id) from rituals.go.
+// For each text channel of the space the inner lateral takes the newest
+// qualifying row with a backward scan of idx_messages_channel_timestamp
+// (channel_id, "timestamp"), so the work per channel stops at the first row
+// not sent by this sub's seats; the outer lateral picks the newest of those.
+// Columns (migrations 000001, 000002, 000007, 000023): channels(id, server_id,
+// type), messages(id, channel_id, sender_id NULLable, recipient_id NULLable,
+// "timestamp"); rituals.spaces(sp, server_id) and rituals.seats(sp, sub,
+// user_id) from rituals.go.
 const ritualsFreshSQL = `
-SELECT p.ord, (seat.u IS NOT NULL AND EXISTS (
-	SELECT 1
-	FROM rituals.spaces s
-	JOIN channels c ON c.server_id = s.server_id AND c.type = 'text'
-	JOIN messages m ON m.channel_id = c.id
-	WHERE s.sp = p.sp
-	  AND (m.recipient_id IS NULL OR m.recipient_id = ANY(seat.u))
-	  AND (m.sender_id IS NULL OR NOT (m.sender_id = ANY(seat.u)))
-	  AND m."timestamp" > COALESCE(
-	      (SELECT MAX(rm.read_up_to_ts) FROM read_markers rm
-	       WHERE rm.channel_id = c.id AND rm.user_id = ANY(seat.u)),
-	      '-infinity'::timestamptz)
-)) AS fresh
+SELECT p.ord, latest.id
 FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS p(sp, sub, ord)
 CROSS JOIN LATERAL (
 	SELECT array_agg(se.user_id) AS u
 	FROM rituals.seats se
 	WHERE se.sp = p.sp AND se.sub = p.sub
 ) seat
+LEFT JOIN LATERAL (
+	SELECT cm.id::text AS id
+	FROM rituals.spaces s
+	JOIN channels c ON c.server_id = s.server_id AND c.type = 'text'
+	CROSS JOIN LATERAL (
+		SELECT m.id, m."timestamp"
+		FROM messages m
+		WHERE m.channel_id = c.id
+		  AND (m.recipient_id IS NULL OR m.recipient_id = ANY(seat.u))
+		  AND (m.sender_id IS NULL OR NOT (m.sender_id = ANY(seat.u)))
+		ORDER BY m."timestamp" DESC, m.id DESC
+		LIMIT 1
+	) cm
+	WHERE s.sp = p.sp AND seat.u IS NOT NULL
+	ORDER BY cm."timestamp" DESC, cm.id DESC
+	LIMIT 1
+) latest ON true
 ORDER BY p.ord`
+
+// ritualsMark is the mark of one message id as Postgres prints uuid::text.
+func ritualsMark(messageID string) string {
+	h := sha256.New()
+	h.Write([]byte(ritualsMarkTag))
+	h.Write([]byte{0})
+	h.Write([]byte(messageID))
+	return hex.EncodeToString(h.Sum(nil))[:ritualsMarkHexLen]
+}
 
 func (rt *ritualsRuntime) handleFresh(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -68,17 +94,18 @@ func (rt *ritualsRuntime) handleFresh(w http.ResponseWriter, r *http.Request) {
 		writeRitualsError(w, verr)
 		return
 	}
-	fresh, err := rt.queryFresh(r, p.Pairs)
+	marks, err := rt.queryMarks(r, p.Pairs)
 	if err != nil {
+		// The error never carries a row: no id, sender or space is logged.
 		slog.Error("rituals fresh", "err", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "fresh_failed"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string][]bool{"fresh": fresh})
+	writeJSON(w, http.StatusOK, map[string][]string{"marks": marks})
 }
 
-func (rt *ritualsRuntime) queryFresh(r *http.Request, pairs []ritualsFreshPair) ([]bool, error) {
-	out := make([]bool, len(pairs))
+func (rt *ritualsRuntime) queryMarks(r *http.Request, pairs []ritualsFreshPair) ([]string, error) {
+	out := make([]string, len(pairs))
 	if len(pairs) == 0 {
 		return out, nil
 	}
@@ -94,12 +121,12 @@ func (rt *ritualsRuntime) queryFresh(r *http.Request, pairs []ritualsFreshPair) 
 	defer rows.Close()
 	for rows.Next() {
 		var ord int64
-		var fresh bool
-		if err := rows.Scan(&ord, &fresh); err != nil {
+		var id *string
+		if err := rows.Scan(&ord, &id); err != nil {
 			return nil, err
 		}
-		if ord >= 1 && ord <= int64(len(out)) {
-			out[ord-1] = fresh
+		if ord >= 1 && ord <= int64(len(out)) && id != nil {
+			out[ord-1] = ritualsMark(*id)
 		}
 	}
 	return out, rows.Err()

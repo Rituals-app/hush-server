@@ -1,7 +1,7 @@
 package api
 
-// Rituals fork: peek, claim seat hints, the fresh SQL and the limiter
-// exemption. The unit tests need no database; TestRitualsSeatsAndFreshDB runs
+// Rituals fork: peek, claim seat hints, the fresh marks SQL and the limiter
+// exemption. The unit tests need no database; TestRitualsSeatsAndMarksDB runs
 // against TEST_DATABASE_URL (skipped when unset) with synthetic users and
 // keys generated per run.
 
@@ -96,7 +96,7 @@ func TestRitualsPeekRejectsBadTickets(t *testing.T) {
 	}
 }
 
-func TestRitualsSeatsAndFreshDB(t *testing.T) {
+func TestRitualsSeatsAndMarksDB(t *testing.T) {
 	pool, cleanup := db.SetupTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -159,45 +159,56 @@ func TestRitualsSeatsAndFreshDB(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Fresh: a message from Bob is fresh for Alice (either device), not for Bob.
+	// Marks: the newest text message not sent by this sub's seats.
 	var serverID, channelID string
 	if err := pool.QueryRow(ctx, `SELECT s.server_id, c.id FROM rituals.spaces s JOIN channels c
 		ON c.server_id = s.server_id AND c.type = 'text' WHERE s.sp = $1`, sp).Scan(&serverID, &channelID); err != nil {
 		t.Fatal(err)
 	}
-	send := func(from string, to *string, at time.Time) {
+	send := func(from string, to *string, at time.Time) string {
 		t.Helper()
-		if _, err := pool.Exec(ctx, `INSERT INTO messages (channel_id, sender_id, recipient_id, ciphertext, "timestamp")
-			VALUES ($1, $2, $3, '\x00', $4)`, channelID, from, to, at); err != nil {
+		var id string
+		if err := pool.QueryRow(ctx, `INSERT INTO messages (channel_id, sender_id, recipient_id, ciphertext, "timestamp")
+			VALUES ($1, $2, $3, '\x00', $4) RETURNING id::text`, channelID, from, to, at).Scan(&id); err != nil {
 			t.Fatal(err)
 		}
+		return id
 	}
-	fresh := func(want ...bool) {
+	marks := func(want ...string) {
 		t.Helper()
 		pairs := []ritualsFreshPair{{Sp: sp, Sub: subA}, {Sp: sp, Sub: subB}, {Sp: sp, Sub: subC}, {Sp: unknown, Sub: subA}}
-		got, err := rt.queryFresh(httptest.NewRequest(http.MethodPost, "/", nil), pairs)
+		got, err := rt.queryMarks(httptest.NewRequest(http.MethodPost, "/", nil), pairs)
 		if err != nil {
 			t.Fatal(err)
 		}
+		if len(got) != len(want) {
+			t.Fatalf("marks = %v, want %v", got, want)
+		}
 		for i := range want {
 			if got[i] != want[i] {
-				t.Fatalf("fresh = %v, want %v", got, want)
+				t.Fatalf("marks = %v, want %v", got, want)
 			}
 		}
 	}
-	fresh(false, false, false, false)
-	t1 := now.Add(-time.Minute)
-	send(bob, nil, t1)
-	fresh(true, false, false, false)
-	// Read on Alice's second device clears it for both of her devices.
-	if _, err := pool.Exec(ctx, `INSERT INTO read_markers (channel_id, user_id, read_up_to_ts) VALUES ($1, $2, $3)`,
-		channelID, aliceTwo, t1); err != nil {
-		t.Fatal(err)
+	m := ritualsMark
+	marks("", "", "", "") // no messages; subC never claimed; unknown sp
+	fromBob := send(bob, nil, now.Add(-3*time.Minute))
+	marks(m(fromBob), "", "", "")
+	// Alice's own newer message (second device) does not move her mark: her
+	// pair falls back to Bob's row; Bob's pair now sees Alice's.
+	fromAlice := send(aliceTwo, nil, now.Add(-2*time.Minute))
+	marks(m(fromBob), m(fromAlice), "", "")
+	// A row addressed to Bob only counts for Bob, never for Alice.
+	toBob := send(alice, &bob, now.Add(-time.Minute))
+	marks(m(fromBob), m(toBob), "", "")
+	// Same timestamp: the larger id wins, deterministically.
+	tie := now.Add(-30 * time.Second)
+	x, y := send(bob, nil, tie), send(bob, nil, tie)
+	if y < x {
+		x, y = y, x
 	}
-	fresh(false, false, false, false)
-	// A message addressed to Bob only is fresh for Bob, never for Alice.
-	send(alice, &bob, now)
-	fresh(false, true, false, false)
+	marks(m(y), m(toBob), "", "")
+	_ = x
 
 	// Revocation: a sync newer than the ticket that drops Bob makes his peek a 403.
 	if _, err := pool.Exec(ctx, `UPDATE rituals.spaces SET last_sync_iat = $2, allowed_subs = ARRAY[$3]::text[] WHERE sp = $1`,
