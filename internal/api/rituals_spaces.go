@@ -68,10 +68,16 @@ type ritualsClaimResult struct {
 	levelRaised    bool
 	renamed        bool
 	metadata       []byte
+	othersSeated   bool
 }
 
 // handleClaim: POST /api/rituals/spaces/claim {"ticket":"rt1..."} (RequireAuth).
-// 200 {"serverId","channelId"}; errors {"error": code}: 400 bad_ticket,
+// 200 {"serverId","channelId","othersSeated"}. othersSeated is true when this
+// Rituals person (the ticket's sub) already holds a seat in this space from
+// another Hush user, i.e. another device of theirs: the client may then say
+// "Earlier messages are on your other device" truthfully and offer to link
+// this device. It never says anything about other people's seats.
+// Errors {"error": code}: 400 bad_ticket,
 // 403 ticket_expired | ticket_revoked | banned | space_full | guest_not_allowed,
 // 409 seat_conflict.
 func (rt *ritualsRuntime) handleClaim(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +113,11 @@ func (rt *ritualsRuntime) handleClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rt.announceClaim(context.WithoutCancel(r.Context()), userID, res)
-	writeJSON(w, http.StatusOK, map[string]string{"serverId": res.serverID, "channelId": res.channelID})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"serverId":     res.serverID,
+		"channelId":    res.channelID,
+		"othersSeated": res.othersSeated,
+	})
 }
 
 func (rt *ritualsRuntime) claimSpace(ctx context.Context, userID string, t *ritualsTicket) (*ritualsClaimResult, *ritualsError, error) {
@@ -174,6 +184,11 @@ func (rt *ritualsRuntime) claimSpace(ctx context.Context, userID string, t *ritu
 		return nil, nil, err
 	case seatSub != t.Sub:
 		return nil, &ritualsError{http.StatusConflict, "seat_conflict"}, nil
+	}
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM rituals.seats WHERE sp = $1 AND sub = $2 AND user_id <> $3)`,
+		t.Sp, t.Sub, userID).Scan(&res.othersSeated); err != nil {
+		return nil, nil, err
 	}
 
 	// Membership: insert at the ticket's level, or raise a lower level.
