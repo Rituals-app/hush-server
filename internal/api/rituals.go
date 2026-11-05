@@ -11,8 +11,9 @@ package api
 //
 // Files:
 //   rituals.go         runtime, config, startup bootstrap, routes
-//   rituals_ticket.go  rt1 ticket / rts1 sync verification
+//   rituals_ticket.go  rt1 ticket / rts1 sync / rtf1 fresh verification
 //   rituals_spaces.go  POST /api/rituals/spaces/claim and /sync
+//   rituals_fresh.go   POST /api/rituals/spaces/fresh (content-free new flag)
 //   rituals_guard.go   small hooks called from upstream handlers
 //   rituals_realip.go  client IP behind the Caddy edge
 //
@@ -130,8 +131,10 @@ func DisableRituals() { ritualsCurrent.Store(nil) }
 
 func (rt *ritualsRuntime) routes(jwtSecret string) chi.Router {
 	r := chi.NewRouter()
-	// Server to server from the Rituals API: the signed blob is the auth.
+	// Server to server from the Rituals API: the signed blob is the auth
+	// (rate limited by the global per-IP limiter only).
 	r.Post("/spaces/sync", rt.handleSync)
+	r.Post("/spaces/fresh", rt.handleFresh)
 	r.Group(func(r chi.Router) {
 		r.Use(RequireAuth(jwtSecret, rt.pool))
 		r.Use(UserRateLimiter(rate.Limit(30.0/60.0), 10))
