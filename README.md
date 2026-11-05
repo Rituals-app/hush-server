@@ -1,3 +1,16 @@
+> **Modified by Rituals, 2026-11-05.** This is a modified version of
+> [hush-server](https://github.com/hushhq/hush-server) by hushhq, free software
+> under the GNU Affero General Public License v3 (see `LICENSE`, unchanged).
+> Changes on branch `rituals`: Rituals Spaces (`POST /api/rituals/spaces/claim`
+> and `/sync`, signed `rt1`/`rts1` verification, the `rituals` Postgres schema),
+> a signed-ticket registration gate, a `RITUALS_MODE` instance policy and
+> space lifecycle blocks, and hardening (no register-as-login, membership
+> checks on MLS routes, owner-only key packages and Welcomes, server-only MLS
+> remove requests, co-member-only search and DMs, real client IP behind our
+> proxy, build version in `/api/health`). Source of this version:
+> https://github.com/Rituals-app/hush-server and https://space.rit.al/source/.
+> No warranty.
+
 ![Build](https://img.shields.io/badge/build-passing-brightgreen)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 ![Go](https://img.shields.io/badge/go-1.25+-00ADD8)
