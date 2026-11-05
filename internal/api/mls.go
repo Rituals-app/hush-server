@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"golang.org/x/time/rate"
 )
 
 const maxKeyPackagesPerUpload = 200
@@ -38,6 +39,9 @@ func MLSRoutes(store db.Store, hub MLSBroadcaster, jwtSecret string, transparenc
 	r := chi.NewRouter()
 	h := &mlsHandler{store: store, hub: hub, transparencySvc: transparencySvc}
 	r.Use(RequireAuth(jwtSecret, store))
+	// Rituals fork: the per-user limiter needs the user id RequireAuth sets;
+	// mounted above RequireAuth (as upstream did in server.go) it never applied.
+	r.Use(UserRateLimiter(rate.Limit(300.0/60.0), 120))
 	r.Post("/credentials", h.uploadCredential)
 	r.Post("/key-packages", h.uploadKeyPackages)
 	r.Get("/key-packages/count", h.getKeyPackageCount)
@@ -262,6 +266,9 @@ func (h *mlsHandler) consumeKeyPackage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "deviceId is required"})
 		return
 	}
+	if !ritualsRequireOwnKeyPackages(w, r, targetUserID) {
+		return
+	}
 
 	kpBytes, err := h.store.ConsumeMLSKeyPackage(r.Context(), targetUserID, deviceID)
 	if err != nil {
@@ -340,6 +347,9 @@ func (h *mlsHandler) getGroupInfo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid channelId"})
 		return
 	}
+	if !ritualsRequireChannelMember(w, r, h.store, channelID) {
+		return
+	}
 
 	groupType := resolveGroupType(r)
 	groupInfoBytes, epoch, err := h.store.GetMLSGroupInfo(r.Context(), channelID, groupType)
@@ -366,6 +376,9 @@ func (h *mlsHandler) putGroupInfo(w http.ResponseWriter, r *http.Request) {
 	channelID := chi.URLParam(r, "channelId")
 	if _, err := uuid.Parse(channelID); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid channelId"})
+		return
+	}
+	if !ritualsRequireChannelMember(w, r, h.store, channelID) {
 		return
 	}
 
@@ -417,6 +430,9 @@ func (h *mlsHandler) postCommit(w http.ResponseWriter, r *http.Request) {
 	userID := userIDFromContext(r.Context())
 	if userID == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "not authenticated"})
+		return
+	}
+	if !ritualsRequireChannelMember(w, r, h.store, channelID) {
 		return
 	}
 	deviceID := deviceIDFromContext(r.Context())
@@ -498,6 +514,9 @@ func (h *mlsHandler) getCommitsSinceEpoch(w http.ResponseWriter, r *http.Request
 	channelID := chi.URLParam(r, "channelId")
 	if _, err := uuid.Parse(channelID); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid channelId"})
+		return
+	}
+	if !ritualsRequireChannelMember(w, r, h.store, channelID) {
 		return
 	}
 
@@ -586,6 +605,9 @@ func (h *mlsHandler) deletePendingWelcome(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "welcomeId is required"})
 		return
 	}
+	if !ritualsRequireOwnWelcome(w, r, h.store, welcomeID) {
+		return
+	}
 
 	if err := h.store.DeletePendingWelcome(r.Context(), welcomeID); err != nil {
 		slog.Error("mls: delete pending welcome", "err", err)
@@ -622,6 +644,9 @@ func (h *mlsHandler) getGuildGroupInfo(w http.ResponseWriter, r *http.Request) {
 	guildID := chi.URLParam(r, "guildId")
 	if _, err := uuid.Parse(guildID); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid guildId"})
+		return
+	}
+	if !ritualsRequireGuildMember(w, r, h.store, guildID) {
 		return
 	}
 

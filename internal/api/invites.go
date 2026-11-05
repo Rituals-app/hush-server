@@ -109,6 +109,9 @@ func (h *inviteHandler) createInvite(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "not authenticated"})
 		return
 	}
+	if ritualsBlockInvite(w, r, serverID) {
+		return
+	}
 	level := guildLevelFromContext(r.Context())
 	if level < models.PermissionLevelMod {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "mod level or higher required to create invites"})

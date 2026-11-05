@@ -381,6 +381,9 @@ func (h *serversHandler) getServer(w http.ResponseWriter, r *http.Request) {
 // Restricted to the guild owner only.
 func (h *serversHandler) deleteServer(w http.ResponseWriter, r *http.Request) {
 	serverID := chi.URLParam(r, "serverId")
+	if ritualsBlockManagedSpace(w, r, serverID) {
+		return
+	}
 	level := guildLevelFromContext(r.Context())
 	if level != models.PermissionLevelOwner {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "only the guild owner can delete the server"})
@@ -451,6 +454,9 @@ func (h *serversHandler) changeRole(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "target user not found in this guild"})
 		return
 	}
+	if ritualsBlockRoleChange(w, r, serverID, targetLevel, req.PermissionLevel) {
+		return
+	}
 	if actorLevel <= targetLevel {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot modify a member with equal or higher permission level"})
 		return
@@ -493,6 +499,9 @@ func (h *serversHandler) leaveServer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "not authenticated"})
 		return
 	}
+	if ritualsBlockManagedSpace(w, r, serverID) {
+		return
+	}
 	level := guildLevelFromContext(r.Context())
 	if level == models.PermissionLevelOwner {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "guild owner cannot leave; transfer ownership first"})
@@ -525,6 +534,9 @@ func (h *serversHandler) joinServer(w http.ResponseWriter, r *http.Request) {
 	userID := userIDFromContext(r.Context())
 	if userID == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "not authenticated"})
+		return
+	}
+	if ritualsBlockManagedSpace(w, r, serverID) {
 		return
 	}
 

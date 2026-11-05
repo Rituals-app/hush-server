@@ -83,6 +83,14 @@ func main() {
 	if cfg.CORSOrigin == "" {
 		cfg.CORSOrigin = "*"
 	}
+	// Rituals fork: in RITUALS_MODE the ticket key and origin are required.
+	if cfg.RitualsMode {
+		if err := api.ValidateRitualsConfig(cfg.RitualsSpaceOrigin, cfg.RitualsTicketPublicKey); err != nil {
+			slog.Error("rituals: invalid configuration", "err", err)
+			os.Exit(1)
+		}
+		slog.Info("rituals: mode on", "space_origin", cfg.RitualsSpaceOrigin)
+	}
 
 	handshakeCache := api.NewInstanceCache()
 
@@ -125,6 +133,15 @@ func main() {
 			os.Exit(1)
 		}
 		defer pool.Close()
+
+		// Rituals fork: create the rituals schema and force the instance
+		// policy before the handshake cache is seeded from instance_config.
+		if cfg.RitualsMode {
+			if err := api.RitualsBootstrap(ctx, pool); err != nil {
+				slog.Error("rituals: bootstrap failed", "err", err)
+				os.Exit(1)
+			}
+		}
 
 		// Seed handshake cache from instance_config at startup.
 		icfg, seedErr := pool.GetInstanceConfig(ctx)

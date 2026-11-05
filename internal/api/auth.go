@@ -209,7 +209,10 @@ func (h *authHandler) register(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "registration failed"})
 		return
 	}
-	switch cfg.RegistrationMode {
+	// Rituals fork: an inviteCode starting "rt1." is a signed Rituals ticket;
+	// its jti is consumed only after the user row exists (see below).
+	var ritualsJTI string
+	switch ritualsRegistrationMode(cfg.RegistrationMode) {
 	case "closed":
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "Registration is closed"})
 		return
@@ -217,6 +220,13 @@ func (h *authHandler) register(w http.ResponseWriter, r *http.Request) {
 		if req.InviteCode == "" {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "An invite code is required"})
 			return
+		}
+		if isRitualsTicketCode(req.InviteCode) {
+			var ok bool
+			if ritualsJTI, ok = ritualsRegistrationGate(w, r, req.InviteCode); !ok {
+				return
+			}
+			break
 		}
 		invite, err := h.store.GetInviteByCode(r.Context(), req.InviteCode)
 		if err != nil || invite == nil {
@@ -230,31 +240,14 @@ func (h *authHandler) register(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Probe for existing user with this public key - account recovery detection.
-	// GetUserByPublicKey error (e.g. DB issue) is fail-open: fall through to
-	// CreateUserWithPublicKey which will either succeed or return its own error.
+	// Probe for existing user with this public key.
+	// Rituals fork: register is not a login. Upstream re-registered a device and
+	// returned a session for a known root key without any proof of possession;
+	// a known key must sign in with /challenge + /verify instead (the web
+	// client's recovery already does). GetUserByPublicKey errors stay
+	// fail-open: CreateUserWithPublicKey then rejects the duplicate key itself.
 	if existingUser, _ := h.store.GetUserByPublicKey(r.Context(), publicKeyBytes); existingUser != nil {
-		// Account recovery: same root public key re-registering (new device, lost device).
-		// This is the highest-risk operation per CONTEXT.md; log synchronously.
-		if h.transparencySvc != nil {
-			entry := &transparency.LogEntry{
-				OperationType: transparency.OpAccountRecovery,
-				UserPublicKey: publicKeyBytes,
-				Timestamp:     time.Now().Unix(),
-			}
-			if logErr := h.transparencySvc.AppendAndNotify(r.Context(), entry, existingUser.ID); logErr != nil {
-				slog.Error("transparency: append account_recovery entry", "err", logErr, "user_id", existingUser.ID)
-			}
-		}
-		// Re-insert device key for the new device (ON CONFLICT DO UPDATE - idempotent).
-		deviceID := req.DeviceID
-		if deviceID == "" {
-			deviceID = uuid.New().String()
-		}
-		if err := h.store.InsertDeviceKey(r.Context(), existingUser.ID, deviceID, req.Label, publicKeyBytes, nil); err != nil {
-			slog.Error("insert device key on account recovery", "err", err)
-		}
-		h.sendAuthResponse(w, r, existingUser, deviceID)
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "Public key already registered"})
 		return
 	}
 
@@ -283,6 +276,9 @@ func (h *authHandler) register(w http.ResponseWriter, r *http.Request) {
 		}
 		slog.Error("create user with public key", "err", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "registration failed"})
+		return
+	}
+	if !ritualsConsumeRegistrationTicket(w, r, ritualsJTI, user.ID) {
 		return
 	}
 
@@ -323,6 +319,9 @@ func (h *authHandler) register(w http.ResponseWriter, r *http.Request) {
 //
 // Returns: { token, guestId, expiresAt }
 func (h *authHandler) guestAuth(w http.ResponseWriter, r *http.Request) {
+	if ritualsBlockGuest(w) {
+		return
+	}
 	// Generate an ephemeral Ed25519 keypair for the guest identity display name.
 	// The public key is returned to the client as an opaque identifier - it is
 	// NOT stored in the database and cannot be used for account recovery.

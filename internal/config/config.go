@@ -31,6 +31,14 @@ type Config struct {
 	// /api/gif/search route returns 503 — the chat surface keeps
 	// working, just without the GIF picker.
 	GiphyAPIKey string
+
+	// Rituals fork (see internal/api/rituals.go). RitualsMode turns on the
+	// Rituals Spaces routes, the signed-ticket registration gate, the
+	// startup instance policy and the extra hardening. When it is on, the
+	// ticket public key is required (base64url, no padding, 32 bytes).
+	RitualsMode            bool
+	RitualsSpaceOrigin     string
+	RitualsTicketPublicKey string
 }
 
 // Load reads configuration from environment variables.
@@ -63,6 +71,13 @@ func Load() Config {
 		}
 	}
 
+	rm := strings.ToLower(strings.TrimSpace(os.Getenv("RITUALS_MODE")))
+	ritualsMode := rm == "1" || rm == "true" || rm == "yes"
+	ritualsOrigin := strings.TrimRight(strings.TrimSpace(os.Getenv("RITUALS_SPACE_ORIGIN")), "/")
+	if ritualsMode && ritualsOrigin == "" {
+		ritualsOrigin = "https://space.rit.al"
+	}
+
 	return Config{
 		Port:                      port,
 		DatabaseURL:               os.Getenv("DATABASE_URL"),
@@ -80,6 +95,9 @@ func Load() Config {
 		LiveKitPublicURL:          os.Getenv("LIVEKIT_PUBLIC_URL"),
 		TransparencyLogPrivateKey: os.Getenv("TRANSPARENCY_LOG_PRIVATE_KEY"),
 		GiphyAPIKey:               os.Getenv("GIPHY_API_KEY"),
+		RitualsMode:               ritualsMode,
+		RitualsSpaceOrigin:        ritualsOrigin,
+		RitualsTicketPublicKey:    strings.TrimSpace(os.Getenv("RITUALS_TICKET_PUBLIC_KEY")),
 	}
 }
 

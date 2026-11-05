@@ -10,8 +10,10 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -22,6 +24,7 @@ import (
 	"github.com/hushhq/hush-server/internal/livekit"
 	"github.com/hushhq/hush-server/internal/storage"
 	"github.com/hushhq/hush-server/internal/transparency"
+	"github.com/hushhq/hush-server/internal/version"
 	"github.com/hushhq/hush-server/internal/ws"
 
 	"github.com/go-chi/chi/v5"
@@ -69,10 +72,18 @@ func BuildServer(d Deps) (http.Handler, *ws.Hub) {
 	httpMetrics := d.HTTPMetrics
 
 	wsOrigin := api.WSOriginFromCORSOrigin(cfg.CORSOrigin)
+	// Rituals fork: reset the process-wide Rituals runtime; it is installed
+	// below only in RITUALS_MODE with a database.
+	api.DisableRituals()
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
+	if cfg.RitualsMode {
+		// Rituals fork: client IP from our Caddy edge only (see rituals_realip.go).
+		r.Use(api.RitualsRealIP)
+	} else {
+		r.Use(chimiddleware.RealIP)
+	}
 	r.Use(chimiddleware.Logger)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(api.HTTPMetricsMiddleware(httpMetrics))
@@ -87,17 +98,19 @@ func BuildServer(d Deps) (http.Handler, *ws.Hub) {
 	// endpoint-specific limiters for more sensitive surfaces.
 	r.Use(api.IPRateLimiter(rate.Limit(600.0/60.0), 300))
 
+	// Rituals fork: `version` (the BUILD_VERSION ldflag, as in the handshake's
+	// server_version) lets a release wait for the new build to answer.
 	healthHandler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if pool != nil {
 			if err := pool.Ping(r.Context()); err != nil {
 				w.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = w.Write([]byte(`{"status":"unavailable","error":"db"}`))
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": "unavailable", "error": "db", "version": version.ServerVersion})
 				return
 			}
 		}
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": version.ServerVersion})
 	}
 	r.Get("/api/health", healthHandler)
 	r.Post("/api/health", healthHandler)
@@ -123,9 +136,10 @@ func BuildServer(d Deps) (http.Handler, *ws.Hub) {
 		// MLS key management: per-user limit. The client legitimately polls
 		// commits/count endpoints across multiple active groups during steady
 		// state and reconnect recovery, so 10/min self-DOSes normal usage.
-		// Keep a limiter here, but move it well above expected app chatter.
+		// Keep a limiter, but well above expected app chatter. Rituals fork:
+		// the limiter now sits inside MLSRoutes, below RequireAuth, because a
+		// per-user limiter mounted here saw no user id and never applied.
 		r.Route("/api/mls", func(sub chi.Router) {
-			sub.Use(api.UserRateLimiter(rate.Limit(300.0/60.0), 120))
 			sub.Mount("/", api.MLSRoutes(pool, wsHub, cfg.JWTSecret, transparencySvc))
 		})
 		r.Mount("/api/instance", api.InstanceRoutes(pool, wsHub, cfg.JWTSecret, handshakeCache))
@@ -139,6 +153,24 @@ func BuildServer(d Deps) (http.Handler, *ws.Hub) {
 		// to evict participants from active voice rooms. Falls back to
 		// a no-op when LiveKit is not configured.
 		roomService := livekit.NewTwirpRoomService(cfg.LiveKitURL, cfg.LiveKitAPIKey, cfg.LiveKitAPISecret)
+
+		// Rituals fork: Spaces routes plus the hooks in upstream handlers
+		// (internal/api/rituals*.go). main validated the settings already.
+		if cfg.RitualsMode {
+			ritualsRoutes, err := api.EnableRituals(api.RitualsOptions{
+				SpaceOrigin:     cfg.RitualsSpaceOrigin,
+				TicketPublicKey: cfg.RitualsTicketPublicKey,
+				Pool:            pool,
+				Hub:             wsHub,
+				RoomService:     roomService,
+				JWTSecret:       cfg.JWTSecret,
+			})
+			if err != nil {
+				slog.Error("rituals: spaces disabled", "err", err)
+			} else {
+				r.Mount("/api/rituals", ritualsRoutes)
+			}
+		}
 
 		// Storage backend for attachment presign URLs. Lazy-built per
 		// request via the closure so a transient backend outage does not

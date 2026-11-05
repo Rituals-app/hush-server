@@ -335,18 +335,20 @@ func TestRegister_InstanceUserLimitReached_Returns403(t *testing.T) {
 	assert.Equal(t, "Registration limit reached", resp["error"])
 }
 
-func TestRegister_AccountRecovery_ExistingPublicKey_ReturnsAuthResponse(t *testing.T) {
+// Rituals fork: register is no longer a login for a known root key (it gave a
+// session with no proof of possession); the expectation changed from 200 to 409.
+func TestRegister_ExistingPublicKey_Returns409(t *testing.T) {
 	pubBase64, _ := generateEd25519KeyPair(t)
 	existingUser := newTestUser("alice")
 
 	store := &mockStore{
-		// Probe finds the existing user - account recovery path taken.
+		// Probe finds the existing user.
 		getUserByPublicKeyFn: func(_ context.Context, _ []byte) (*models.User, error) {
 			return existingUser, nil
 		},
-		// CreateUserWithPublicKey must NOT be called in the recovery path.
+		// CreateUserWithPublicKey must NOT be called for a known key.
 		createUserWithPublicKeyFn: func(_ context.Context, _, _ string, _ []byte) (*models.User, error) {
-			return nil, errors.New("should not be called in account recovery path")
+			return nil, errors.New("should not be called for a known public key")
 		},
 	}
 	router := newTestRouter(store)
@@ -356,11 +358,9 @@ func TestRegister_AccountRecovery_ExistingPublicKey_ReturnsAuthResponse(t *testi
 		PublicKey: pubBase64,
 	})
 
-	// Recovery path returns 200 OK with a valid auth response (same as normal register).
-	assert.Equal(t, http.StatusOK, rr.Code)
-	resp := decodeAuthResponse(t, rr)
-	assert.NotEmpty(t, resp.Token)
-	assert.Equal(t, existingUser.ID, resp.User.ID)
+	assert.Equal(t, http.StatusConflict, rr.Code)
+	resp := decodeErrorResponse(t, rr)
+	assert.Equal(t, "Public key already registered", resp["error"])
 }
 
 func TestRegister_DuplicateUsername_Returns409(t *testing.T) {
