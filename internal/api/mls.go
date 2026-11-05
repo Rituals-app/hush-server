@@ -325,6 +325,10 @@ type postCommitRequest struct {
 	GroupInfo   string `json:"groupInfo"`
 	Epoch       int64  `json:"epoch"`
 	Ciphersuite int    `json:"ciphersuite"`
+	// Rituals fork (wire contract Item 1): the epoch the commit was built on,
+	// and the leaves a Remove commit removes. Old clients send neither.
+	ParentEpoch *int64          `json:"parentEpoch,omitempty"`
+	Removes     json.RawMessage `json:"removes,omitempty"`
 }
 
 // resolveGroupType reads the ?type= query parameter and returns "text" or "voice".
@@ -407,6 +411,17 @@ func (h *mlsHandler) putGroupInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if rt := ritualsTextCommitActive(groupType); rt != nil {
+		// Rituals: text group info only moves forward; the reply is 204
+		// even when the guard skipped the write (wire contract D6).
+		if err := rt.putTextGroupInfo(r.Context(), channelID, groupInfoBytes, req.Epoch, req.Ciphersuite); err != nil {
+			slog.Error("mls: upsert group info", "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store group info"})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if err := h.store.UpsertMLSGroupInfo(r.Context(), channelID, groupType, groupInfoBytes, req.Epoch); err != nil {
 		slog.Error("mls: upsert group info", "err", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store group info"})
@@ -455,6 +470,12 @@ func (h *mlsHandler) postCommit(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid commitBytes base64"})
 		return
+	}
+
+	if rt := ritualsTextCommitActive(groupType); rt != nil {
+		if rt.postTextCommit(w, r, h.hub.Broadcast, channelID, userID, deviceID, &req, commitBytes) {
+			return
+		}
 	}
 
 	ctx := r.Context()

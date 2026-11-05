@@ -190,6 +190,11 @@ func (rt *ritualsRuntime) claimSpace(ctx context.Context, userID string, t *ritu
 	case seatSub != t.Sub:
 		return nil, &ritualsError{http.StatusConflict, "seat_conflict"}, nil
 	}
+	// A re-seated person must not be removed again by a stale pending
+	// remove request (wire contract Item 2, D16).
+	if err := ritualsClearPendingForSeat(ctx, tx, userID, res.serverID); err != nil {
+		return nil, nil, err
+	}
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS (SELECT 1 FROM rituals.seats WHERE sp = $1 AND sub = $2 AND user_id <> $3),
 		       EXISTS (SELECT 1 FROM rituals.seats WHERE sp = $1 AND sub <> $2)`,
@@ -506,6 +511,11 @@ func (rt *ritualsRuntime) applySync(ctx context.Context, p *ritualsSync) (*ritua
 			return nil, err
 		}
 	}
+	// Pending MLS remove requests, written in this transaction so a crash
+	// after the seat deletion cannot lose them (wire contract Item 2, D14).
+	if err := ritualsRecordPendingRemovals(ctx, tx, res.textChannels, res.removedMembers); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -556,9 +566,14 @@ func (rt *ritualsRuntime) announceSync(res *ritualsSyncResult) {
 			rt.broadcastMLSRemovals(ctx, uid, res.textChannels)
 		}
 		hub := rt.hub
+		serverID := res.serverID
+		channels := append(append([]string(nil), res.textChannels...), res.voiceChannels...)
+		// Drop the removed person from this server and its channels only, on
+		// every connection, without closing any socket: their other Spaces on
+		// the same tab stay live (wire contract Item 3, D18).
 		time.AfterFunc(500*time.Millisecond, func() {
 			for _, uid := range removed {
-				hub.DisconnectUser(uid)
+				hub.DisconnectUserFromServer(uid, serverID, channels)
 			}
 		})
 	}
@@ -581,14 +596,7 @@ func (rt *ritualsRuntime) broadcastMLSRemovals(ctx context.Context, userID strin
 		for _, deviceID := range devices {
 			// Same shape as handleMLSLeaveProposal; requester ids come from
 			// the server, never from a client.
-			frame, _ := json.Marshal(map[string]string{
-				"type":                "mls.add_request",
-				"channel_id":          channelID,
-				"action":              "remove",
-				"requester_id":        userID,
-				"requester_device_id": deviceID,
-			})
-			rt.hub.Broadcast(channelID, frame, "")
+			rt.hub.Broadcast(channelID, ritualsRemovalFrame(channelID, userID, deviceID), "")
 		}
 	}
 }

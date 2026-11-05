@@ -45,6 +45,12 @@ import (
 type RitualsHub interface {
 	GlobalBroadcaster
 	Broadcast(channelID string, message []byte, excludeClientID string)
+	// DisconnectUserFromServer drops a removed member from one server and
+	// its channels without closing sockets (wire contract Item 3, D18).
+	DisconnectUserFromServer(userID, serverID string, channelIDs []string)
+	// SetSubscribeHook installs the per-subscribe replay of pending MLS
+	// remove requests (wire contract Item 2, D15).
+	SetSubscribeHook(fn func(ctx context.Context, channelID, userID string) [][]byte)
 }
 
 // RitualsOptions wires the Rituals Spaces runtime (see EnableRituals).
@@ -124,6 +130,9 @@ func EnableRituals(opts RitualsOptions) (chi.Router, error) {
 		now:         time.Now,
 	}
 	ritualsCurrent.Store(rt)
+	if rt.hub != nil {
+		rt.hub.SetSubscribeHook(rt.pendingRemovalFrames)
+	}
 	return rt.routes(opts.JWTSecret), nil
 }
 
@@ -202,6 +211,21 @@ var ritualsSchemaSQL = []string{
 		user_id    UUID        REFERENCES public.users(id) ON DELETE SET NULL,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 	)`,
+	// Pending MLS remove requests (wire contract Item 2, D14): one row per
+	// removed user x text channel x MLS device, replayed on subscribe until a
+	// commit's removes hint, a re-seat, the 30-day TTL or the channel's
+	// deletion clears it. No FK on user_id: the leaf outlives a deleted user.
+	// The primary key serves the replay, hint and re-seat deletes; the
+	// created_at index serves the TTL delete. Bounded per sync by the 64
+	// device cap per user and the space's member and channel caps.
+	`CREATE TABLE IF NOT EXISTS rituals.pending_mls_removals (
+		channel_id UUID        NOT NULL REFERENCES public.channels(id) ON DELETE CASCADE,
+		user_id    UUID        NOT NULL,
+		device_id  TEXT        NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		PRIMARY KEY (channel_id, user_id, device_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS pending_mls_removals_created_idx ON rituals.pending_mls_removals (created_at)`,
 }
 
 // RitualsBootstrap creates the rituals schema and forces the Rituals instance
