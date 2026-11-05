@@ -1,8 +1,10 @@
 package ws
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
+	"sort"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -15,6 +17,10 @@ type Hub struct {
 	channels map[string]map[string]*Client   // channelID -> clientID -> client
 	servers  map[string]map[string]*Client   // serverID -> clientID -> client
 	presence map[string]struct{}             // userID -> present
+
+	// Rituals fork: called after an accepted channel subscribe; the frames
+	// it returns go to that client only (see SetSubscribeHook).
+	subscribeHook func(ctx context.Context, channelID, userID string) [][]byte
 }
 
 // NewHub creates a new Hub.
@@ -39,7 +45,8 @@ func (h *Hub) Register(c *Client) {
 	} else {
 		h.presence[c.userID] = struct{}{}
 	}
-	h.broadcastPresenceLocked()
+	// A new connection shares no server yet: only its own list changes.
+	h.refreshPresenceLocked([]*Client{c})
 }
 
 // Unregister removes a client and broadcasts presence update.
@@ -47,6 +54,10 @@ func (h *Hub) Register(c *Client) {
 func (h *Hub) Unregister(c *Client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if _, ok := h.clients[c.id]; !ok {
+		return
+	}
+	peers := h.serverPeersLocked(c)
 	delete(h.clients, c.id)
 	for _, m := range h.channels {
 		delete(m, c.id)
@@ -63,7 +74,8 @@ func (h *Hub) Unregister(c *Client) {
 			delete(h.presence, c.userID)
 		}
 	}
-	h.broadcastPresenceLocked()
+	c.servers = nil
+	h.refreshPresenceLocked(peers)
 }
 
 // hasOtherClientForUser returns true if any remaining client belongs to the given userID.
@@ -118,18 +130,97 @@ func (h *Hub) SubscribeToServer(c *Client, serverID string) {
 		h.servers[serverID] = make(map[string]*Client)
 	}
 	h.servers[serverID][c.id] = c
+	if c.servers == nil {
+		c.servers = make(map[string]struct{})
+	}
+	c.servers[serverID] = struct{}{}
+	h.refreshPresenceLocked(h.serverClientsLocked(serverID))
 }
 
 // UnsubscribeFromServer removes the client from the server's subscriber set.
 func (h *Hub) UnsubscribeFromServer(c *Client, serverID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if _, ok := h.servers[serverID][c.id]; !ok {
+		return
+	}
+	affected := h.serverClientsLocked(serverID)
+	h.unsubscribeServerLocked(c, serverID)
+	h.refreshPresenceLocked(affected)
+}
+
+// unsubscribeServerLocked drops c from serverID's set. Caller holds h.mu.
+func (h *Hub) unsubscribeServerLocked(c *Client, serverID string) {
 	if m := h.servers[serverID]; m != nil {
 		delete(m, c.id)
 		if len(m) == 0 {
 			delete(h.servers, serverID)
 		}
 	}
+	delete(c.servers, serverID)
+}
+
+// DisconnectUserFromServer removes every connection of userID from one
+// server and the given channels without closing any socket, so the person's
+// other Spaces on the same connection stay live.
+//
+// Rituals fork (wire contract Item 3, D18): replaces the instance-wide
+// DisconnectUser for a Rituals sync removal. A connection that was not
+// subscribed to serverID missed the member_kicked broadcast, so it gets the
+// same frame directly; a subscribed one already has it and gets nothing
+// twice. Presence is recomputed for everyone who shared the server.
+func (h *Hub) DisconnectUserFromServer(userID, serverID string, channelIDs []string) {
+	if userID == "" || serverID == "" {
+		return
+	}
+	kicked, _ := json.Marshal(map[string]interface{}{
+		"type":      "member_kicked",
+		"server_id": serverID,
+		"user_id":   userID,
+	})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	affected := h.serverClientsLocked(serverID)
+	for _, c := range h.clients {
+		if c.userID != userID {
+			continue
+		}
+		if _, subscribed := h.servers[serverID][c.id]; subscribed {
+			h.unsubscribeServerLocked(c, serverID)
+		} else {
+			select {
+			case c.send <- kicked:
+			default:
+				slog.Warn("ws client send buffer full", "clientID", c.id)
+			}
+		}
+		for _, channelID := range channelIDs {
+			if m := h.channels[channelID]; m != nil {
+				delete(m, c.id)
+				if len(m) == 0 {
+					delete(h.channels, channelID)
+				}
+			}
+		}
+		affected = append(affected, c)
+	}
+	h.refreshPresenceLocked(affected)
+}
+
+// SetSubscribeHook installs fn, called after an accepted channel subscribe
+// with that client's user id; each frame it returns is queued to that client
+// only, after the subscription took effect. Rituals uses it to replay
+// pending MLS remove requests (wire contract Item 2, D15). nil removes it.
+func (h *Hub) SetSubscribeHook(fn func(ctx context.Context, channelID, userID string) [][]byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.subscribeHook = fn
+}
+
+func (h *Hub) subscribeHookFn() func(ctx context.Context, channelID, userID string) [][]byte {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.subscribeHook
 }
 
 // BroadcastToServer sends the message to all clients subscribed to the given server.
@@ -321,18 +412,76 @@ func (h *Hub) Stats() HubStats {
 	}
 }
 
-func (h *Hub) broadcastPresenceLocked() {
-	userIDs := make([]string, 0, len(h.presence))
-	for uid := range h.presence {
-		userIDs = append(userIDs, uid)
+// presenceKey is the identity a client contributes to presence.
+func presenceKey(c *Client) string {
+	if c.federatedIdentityID != "" {
+		return "fed:" + c.federatedIdentityID
 	}
-	msg, _ := json.Marshal(map[string]interface{}{
-		"type":    "presence.update",
-		"user_ids": userIDs,
-	})
-	for _, c := range h.clients {
+	return c.userID
+}
+
+// serverClientsLocked lists the clients subscribed to serverID.
+func (h *Hub) serverClientsLocked(serverID string) []*Client {
+	m := h.servers[serverID]
+	out := make([]*Client, 0, len(m))
+	for _, c := range m {
+		out = append(out, c)
+	}
+	return out
+}
+
+// serverPeersLocked lists c and every client sharing a subscribed server
+// with c: the clients whose presence list can change when c comes or goes.
+func (h *Hub) serverPeersLocked(c *Client) []*Client {
+	out := []*Client{c}
+	for serverID := range c.servers {
+		out = append(out, h.serverClientsLocked(serverID)...)
+	}
+	return out
+}
+
+// presenceListLocked is what client c may see (wire contract Item 4, D21):
+// itself plus every identity with a connection subscribed to a server c is
+// subscribed to, sorted. Nobody learns who is online outside the Spaces they
+// share, so presence never reveals membership to a non-member.
+func (h *Hub) presenceListLocked(c *Client) []string {
+	seen := map[string]struct{}{presenceKey(c): {}}
+	for serverID := range c.servers {
+		for _, o := range h.servers[serverID] {
+			seen[presenceKey(o)] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// refreshPresenceLocked recomputes the list of each registered client in
+// clients and sends {"type":"presence.update","user_ids":[...]} only when it
+// differs from the last list that client received. Caller holds h.mu.
+func (h *Hub) refreshPresenceLocked(clients []*Client) {
+	done := make(map[string]struct{}, len(clients))
+	for _, c := range clients {
+		if _, dup := done[c.id]; dup {
+			continue
+		}
+		done[c.id] = struct{}{}
+		if _, registered := h.clients[c.id]; !registered {
+			continue
+		}
+		msg, _ := json.Marshal(map[string]interface{}{
+			"type":     "presence.update",
+			"user_ids": h.presenceListLocked(c),
+		})
+		if string(msg) == c.lastPresence {
+			continue
+		}
 		select {
 		case c.send <- msg:
+			c.lastPresence = string(msg)
 		default:
 		}
 	}

@@ -1,10 +1,11 @@
 package api
 
-// Rituals fork: verification of the two signed formats from the integration
-// contract (sections 2 and 3).
+// Rituals fork: verification of the three signed formats from the integration
+// contract (sections 2, 3 and 3b).
 //
 //   ticket = "rt1."  + B64URL(payload) + "." + B64URL(Ed25519(key, "rituals-space-ticket-v1\n" || payload))
 //   sync   = "rts1." + B64URL(payload) + "." + B64URL(Ed25519(key, "rituals-space-sync-v1\n" || payload))
+//   fresh  = "rtf1." + B64URL(payload) + "." + B64URL(Ed25519(key, "rituals-space-fresh-v1\n" || payload))
 //
 // B64URL is base64url without padding; anything outside that alphabet
 // (padding, whitespace, newlines) is rejected before decoding.
@@ -22,14 +23,19 @@ import (
 const (
 	ritualsTicketPrefix = "rt1."
 	ritualsSyncPrefix   = "rts1."
+	ritualsFreshPrefix  = "rtf1."
 	ritualsTicketDomain = "rituals-space-ticket-v1\n"
 	ritualsSyncDomain   = "rituals-space-sync-v1\n"
+	ritualsFreshDomain  = "rituals-space-fresh-v1\n"
 	ritualsTicketMaxLen = 2048
 	ritualsSyncMaxLen   = 8192
 	ritualsExpLeeway    = 30   // seconds a ticket is still accepted after exp
 	ritualsIatSkew      = 60   // seconds iat may run ahead of our clock
 	ritualsMaxLifetime  = 3600 // largest accepted exp - iat
 	ritualsMaxSyncSubs  = 32
+	ritualsFreshMaxLen  = 16 << 10
+	ritualsFreshMaxLife = 60 // largest accepted exp - iat of a fresh query
+	ritualsMaxFreshPair = 64
 )
 
 type ritualsError struct {
@@ -44,6 +50,8 @@ var (
 	errRitualsTicketExpired = &ritualsError{http.StatusForbidden, "ticket_expired"}
 	errRitualsBadSync       = &ritualsError{http.StatusBadRequest, "bad_sync"}
 	errRitualsSyncExpired   = &ritualsError{http.StatusForbidden, "sync_expired"}
+	errRitualsBadFresh      = &ritualsError{http.StatusBadRequest, "bad_fresh"}
+	errRitualsFreshExpired  = &ritualsError{http.StatusForbidden, "fresh_expired"}
 )
 
 func writeRitualsError(w http.ResponseWriter, e *ritualsError) {
@@ -80,6 +88,22 @@ type ritualsSync struct {
 	Name *string  `json:"name"`
 	Iat  int64    `json:"iat"`
 	Exp  int64    `json:"exp"`
+}
+
+// ritualsFresh is the rtf1 payload: a read-only question ("is there
+// something new for this person in this space?") for up to 64 (sp, sub)
+// pairs. No jti: answering twice changes nothing.
+type ritualsFresh struct {
+	V     int                `json:"v"`
+	Aud   string             `json:"aud"`
+	Pairs []ritualsFreshPair `json:"pairs"`
+	Iat   int64              `json:"iat"`
+	Exp   int64              `json:"exp"`
+}
+
+type ritualsFreshPair struct {
+	Sp  string `json:"sp"`
+	Sub string `json:"sub"`
 }
 
 func decodeRitualsB64(s string) ([]byte, bool) {
@@ -212,6 +236,36 @@ func (rt *ritualsRuntime) verifySync(s string) (*ritualsSync, *ritualsError) {
 		return nil, errRitualsBadSync
 	case ritualsWindowExpired:
 		return nil, errRitualsSyncExpired
+	}
+	return &p, nil
+}
+
+// verifyFresh returns the verified rtf1 payload, or bad_fresh (400) /
+// fresh_expired (403). On top of the shared window checks a fresh query
+// lives at most 60 seconds.
+func (rt *ritualsRuntime) verifyFresh(s string) (*ritualsFresh, *ritualsError) {
+	payload, ok := openRitualsSigned(rt.pubKey, s, ritualsFreshPrefix, ritualsFreshDomain, ritualsFreshMaxLen)
+	if !ok {
+		return nil, errRitualsBadFresh
+	}
+	var p ritualsFresh
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, errRitualsBadFresh
+	}
+	if p.V != 1 || p.Aud != rt.origin || p.Pairs == nil || len(p.Pairs) > ritualsMaxFreshPair ||
+		p.Exp-p.Iat > ritualsFreshMaxLife {
+		return nil, errRitualsBadFresh
+	}
+	for _, pair := range p.Pairs {
+		if !ritualsHex64.MatchString(pair.Sp) || !ritualsHex64.MatchString(pair.Sub) {
+			return nil, errRitualsBadFresh
+		}
+	}
+	switch ritualsWindow(p.Iat, p.Exp, rt.now().Unix()) {
+	case ritualsWindowBad:
+		return nil, errRitualsBadFresh
+	case ritualsWindowExpired:
+		return nil, errRitualsFreshExpired
 	}
 	return &p, nil
 }

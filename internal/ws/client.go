@@ -30,6 +30,11 @@ type Client struct {
 	handler             *MessageHandler
 	limiter             *rate.Limiter
 	consecutiveHits     int
+
+	// Guarded by hub.mu: the servers this client subscribed to, and the last
+	// presence.update frame it was sent (sent again only on change).
+	servers      map[string]struct{}
+	lastPresence string
 }
 
 // Run runs the read and write pumps. Call after Register. Blocks until connection closes.
@@ -109,6 +114,7 @@ func (c *Client) handleMessage(raw []byte) {
 	case "subscribe":
 		if msg.ChannelID != "" && c.canAccessChannel(msg.ChannelID) {
 			c.hub.Subscribe(c, msg.ChannelID)
+			c.replayOnSubscribe(msg.ChannelID)
 		} else if msg.ChannelID != "" {
 			sendError(c, "forbidden", "not a channel member")
 		}
@@ -144,6 +150,25 @@ func (c *Client) handleMessage(raw []byte) {
 		}
 		// media.key was removed in M.3-01: frame keys are now derived locally via
 		// MLS export_secret. Sending key bytes over the wire violates the MLS security model.
+	}
+}
+
+// replayOnSubscribe queues the subscribe hook's frames (Rituals: pending MLS
+// remove requests) to this client only. It runs synchronously in the read
+// loop, so the frames precede the reply to any later request on this socket.
+func (c *Client) replayOnSubscribe(channelID string) {
+	hook := c.hub.subscribeHookFn()
+	if hook == nil || c.userID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), handlerTimeout)
+	defer cancel()
+	for _, frame := range hook(ctx, channelID, c.userID) {
+		select {
+		case c.send <- frame:
+		default:
+			slog.Warn("ws client send buffer full", "clientID", c.id)
+		}
 	}
 }
 

@@ -11,8 +11,10 @@ package api
 //
 // Files:
 //   rituals.go         runtime, config, startup bootstrap, routes
-//   rituals_ticket.go  rt1 ticket / rts1 sync verification
+//   rituals_ticket.go  rt1 ticket / rts1 sync / rtf1 fresh verification
 //   rituals_spaces.go  POST /api/rituals/spaces/claim and /sync
+//   rituals_fresh.go   POST /api/rituals/spaces/fresh (content-free new flag)
+//   rituals_peek.go    POST /api/rituals/spaces/peek (seat hints before register)
 //   rituals_guard.go   small hooks called from upstream handlers
 //   rituals_realip.go  client IP behind the Caddy edge
 //
@@ -25,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -42,6 +45,12 @@ import (
 type RitualsHub interface {
 	GlobalBroadcaster
 	Broadcast(channelID string, message []byte, excludeClientID string)
+	// DisconnectUserFromServer drops a removed member from one server and
+	// its channels without closing sockets (wire contract Item 3, D18).
+	DisconnectUserFromServer(userID, serverID string, channelIDs []string)
+	// SetSubscribeHook installs the per-subscribe replay of pending MLS
+	// remove requests (wire contract Item 2, D15).
+	SetSubscribeHook(fn func(ctx context.Context, channelID, userID string) [][]byte)
 }
 
 // RitualsOptions wires the Rituals Spaces runtime (see EnableRituals).
@@ -121,6 +130,9 @@ func EnableRituals(opts RitualsOptions) (chi.Router, error) {
 		now:         time.Now,
 	}
 	ritualsCurrent.Store(rt)
+	if rt.hub != nil {
+		rt.hub.SetSubscribeHook(rt.pendingRemovalFrames)
+	}
 	return rt.routes(opts.JWTSecret), nil
 }
 
@@ -131,13 +143,43 @@ func DisableRituals() { ritualsCurrent.Store(nil) }
 func (rt *ritualsRuntime) routes(jwtSecret string) chi.Router {
 	r := chi.NewRouter()
 	// Server to server from the Rituals API: the signed blob is the auth.
-	r.Post("/spaces/sync", rt.handleSync)
+	// Both skip the global per-IP limiter (RitualsExemptServerToServer) so
+	// the Rituals API's one egress IP never shares a bucket with browsers,
+	// and each has its own per-IP bucket instead.
+	r.With(IPRateLimiter(rate.Limit(600.0/60.0), 300)).Post(ritualsSyncPath, rt.handleSync)
+	r.With(IPRateLimiter(rate.Limit(300.0/60.0), 60)).Post(ritualsFreshPath, rt.handleFresh)
+	// Browser, before register: the signed ticket is the auth; under the
+	// global limiter plus its own, narrower bucket.
+	r.With(IPRateLimiter(rate.Limit(60.0/60.0), 30)).Post("/spaces/peek", rt.handlePeek)
 	r.Group(func(r chi.Router) {
 		r.Use(RequireAuth(jwtSecret, rt.pool))
 		r.Use(UserRateLimiter(rate.Limit(30.0/60.0), 10))
 		r.Post("/spaces/claim", rt.handleClaim)
 	})
 	return r
+}
+
+const (
+	ritualsMount     = "/api/rituals"
+	ritualsSyncPath  = "/spaces/sync"
+	ritualsFreshPath = "/spaces/fresh"
+)
+
+// RitualsExemptServerToServer wraps the global per-IP limiter so it skips
+// exactly POST /api/rituals/spaces/sync and /spaces/fresh, which have their
+// own buckets in routes(). Every other request goes through limiter as before.
+func RitualsExemptServerToServer(limiter func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		limited := limiter(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.Method == http.MethodPost &&
+				(req.URL.Path == ritualsMount+ritualsSyncPath || req.URL.Path == ritualsMount+ritualsFreshPath) {
+				next.ServeHTTP(w, req)
+				return
+			}
+			limited.ServeHTTP(w, req)
+		})
+	}
 }
 
 // ritualsSchemaSQL is applied at every start; every statement is idempotent.
@@ -169,6 +211,21 @@ var ritualsSchemaSQL = []string{
 		user_id    UUID        REFERENCES public.users(id) ON DELETE SET NULL,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 	)`,
+	// Pending MLS remove requests (wire contract Item 2, D14): one row per
+	// removed user x text channel x MLS device, replayed on subscribe until a
+	// commit's removes hint, a re-seat, the 30-day TTL or the channel's
+	// deletion clears it. No FK on user_id: the leaf outlives a deleted user.
+	// The primary key serves the replay, hint and re-seat deletes; the
+	// created_at index serves the TTL delete. Bounded per sync by the 64
+	// device cap per user and the space's member and channel caps.
+	`CREATE TABLE IF NOT EXISTS rituals.pending_mls_removals (
+		channel_id UUID        NOT NULL REFERENCES public.channels(id) ON DELETE CASCADE,
+		user_id    UUID        NOT NULL,
+		device_id  TEXT        NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		PRIMARY KEY (channel_id, user_id, device_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS pending_mls_removals_created_idx ON rituals.pending_mls_removals (created_at)`,
 }
 
 // RitualsBootstrap creates the rituals schema and forces the Rituals instance
