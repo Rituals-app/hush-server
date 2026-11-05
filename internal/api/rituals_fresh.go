@@ -15,8 +15,9 @@ package api
 // sender_id is NULL (a federated sender: someone else) or not in U, and whose
 // "timestamp" is after MAX(read_markers.read_up_to_ts) over U for that channel
 // (no marker: any such message counts). An unknown space or an unclaimed
-// (sp, sub) pair is false. Rate limiting: the global per-IP limiter only, like
-// /spaces/sync; the Rituals API caches, coalesces and caps its own calls.
+// (sp, sub) pair is false. Rate limiting: its own per-IP bucket (5/s, burst
+// 60), outside the global limiter like /spaces/sync; the Rituals API caches,
+// coalesces and caps its own calls (4 reads a second).
 
 import (
 	"encoding/json"

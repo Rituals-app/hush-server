@@ -14,6 +14,7 @@ package api
 //   rituals_ticket.go  rt1 ticket / rts1 sync / rtf1 fresh verification
 //   rituals_spaces.go  POST /api/rituals/spaces/claim and /sync
 //   rituals_fresh.go   POST /api/rituals/spaces/fresh (content-free new flag)
+//   rituals_peek.go    POST /api/rituals/spaces/peek (seat hints before register)
 //   rituals_guard.go   small hooks called from upstream handlers
 //   rituals_realip.go  client IP behind the Caddy edge
 //
@@ -26,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -131,16 +133,44 @@ func DisableRituals() { ritualsCurrent.Store(nil) }
 
 func (rt *ritualsRuntime) routes(jwtSecret string) chi.Router {
 	r := chi.NewRouter()
-	// Server to server from the Rituals API: the signed blob is the auth
-	// (rate limited by the global per-IP limiter only).
-	r.Post("/spaces/sync", rt.handleSync)
-	r.Post("/spaces/fresh", rt.handleFresh)
+	// Server to server from the Rituals API: the signed blob is the auth.
+	// Both skip the global per-IP limiter (RitualsExemptServerToServer) so
+	// the Rituals API's one egress IP never shares a bucket with browsers,
+	// and each has its own per-IP bucket instead.
+	r.With(IPRateLimiter(rate.Limit(600.0/60.0), 300)).Post(ritualsSyncPath, rt.handleSync)
+	r.With(IPRateLimiter(rate.Limit(300.0/60.0), 60)).Post(ritualsFreshPath, rt.handleFresh)
+	// Browser, before register: the signed ticket is the auth; under the
+	// global limiter plus its own, narrower bucket.
+	r.With(IPRateLimiter(rate.Limit(60.0/60.0), 30)).Post("/spaces/peek", rt.handlePeek)
 	r.Group(func(r chi.Router) {
 		r.Use(RequireAuth(jwtSecret, rt.pool))
 		r.Use(UserRateLimiter(rate.Limit(30.0/60.0), 10))
 		r.Post("/spaces/claim", rt.handleClaim)
 	})
 	return r
+}
+
+const (
+	ritualsMount     = "/api/rituals"
+	ritualsSyncPath  = "/spaces/sync"
+	ritualsFreshPath = "/spaces/fresh"
+)
+
+// RitualsExemptServerToServer wraps the global per-IP limiter so it skips
+// exactly POST /api/rituals/spaces/sync and /spaces/fresh, which have their
+// own buckets in routes(). Every other request goes through limiter as before.
+func RitualsExemptServerToServer(limiter func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		limited := limiter(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.Method == http.MethodPost &&
+				(req.URL.Path == ritualsMount+ritualsSyncPath || req.URL.Path == ritualsMount+ritualsFreshPath) {
+				next.ServeHTTP(w, req)
+				return
+			}
+			limited.ServeHTTP(w, req)
+		})
+	}
 }
 
 // ritualsSchemaSQL is applied at every start; every statement is idempotent.

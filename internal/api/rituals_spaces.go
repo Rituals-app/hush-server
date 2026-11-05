@@ -68,15 +68,19 @@ type ritualsClaimResult struct {
 	levelRaised    bool
 	renamed        bool
 	metadata       []byte
+	selfSeated     bool
 	othersSeated   bool
 }
 
 // handleClaim: POST /api/rituals/spaces/claim {"ticket":"rt1..."} (RequireAuth).
-// 200 {"serverId","channelId","othersSeated"}. othersSeated is true when this
-// Rituals person (the ticket's sub) already holds a seat in this space from
-// another Hush user, i.e. another device of theirs: the client may then say
-// "Earlier messages are on your other device" truthfully and offer to link
-// this device. It never says anything about other people's seats.
+// 200 {"serverId","channelId","selfSeated","othersSeated"}. selfSeated is true
+// when this Rituals person (the ticket's sub) also holds a seat in this space
+// from another Hush user, i.e. another device of theirs: the client may then
+// say "Earlier messages are on your other device" truthfully and offer to link
+// this device. othersSeated is true when someone else (a different sub) holds
+// a seat, i.e. the space has people in it already. Neither names anyone.
+// Before registering, the same hints come from POST /spaces/peek (rituals_peek.go),
+// where selfSeated means any seat for the sub, since no Hush user exists yet.
 // Errors {"error": code}: 400 bad_ticket,
 // 403 ticket_expired | ticket_revoked | banned | space_full | guest_not_allowed,
 // 409 seat_conflict.
@@ -116,6 +120,7 @@ func (rt *ritualsRuntime) handleClaim(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"serverId":     res.serverID,
 		"channelId":    res.channelID,
+		"selfSeated":   res.selfSeated,
 		"othersSeated": res.othersSeated,
 	})
 }
@@ -186,8 +191,9 @@ func (rt *ritualsRuntime) claimSpace(ctx context.Context, userID string, t *ritu
 		return nil, &ritualsError{http.StatusConflict, "seat_conflict"}, nil
 	}
 	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM rituals.seats WHERE sp = $1 AND sub = $2 AND user_id <> $3)`,
-		t.Sp, t.Sub, userID).Scan(&res.othersSeated); err != nil {
+		SELECT EXISTS (SELECT 1 FROM rituals.seats WHERE sp = $1 AND sub = $2 AND user_id <> $3),
+		       EXISTS (SELECT 1 FROM rituals.seats WHERE sp = $1 AND sub <> $2)`,
+		t.Sp, t.Sub, userID).Scan(&res.selfSeated, &res.othersSeated); err != nil {
 		return nil, nil, err
 	}
 

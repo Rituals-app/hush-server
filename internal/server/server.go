@@ -96,7 +96,12 @@ func BuildServer(d Deps) (http.Handler, *ws.Hub) {
 	// desktop/web session that restores multiple active groups at once. Keep the
 	// global limiter comfortably above normal app chatter and rely on narrower
 	// endpoint-specific limiters for more sensitive surfaces.
-	r.Use(api.IPRateLimiter(rate.Limit(600.0/60.0), 300))
+	globalLimiter := api.IPRateLimiter(rate.Limit(600.0/60.0), 300)
+	if cfg.RitualsMode {
+		// Rituals fork: the signed server-to-server routes have their own buckets.
+		globalLimiter = api.RitualsExemptServerToServer(globalLimiter)
+	}
+	r.Use(globalLimiter)
 
 	// Rituals fork: `version` (the BUILD_VERSION ldflag, as in the handshake's
 	// server_version) lets a release wait for the new build to answer.
