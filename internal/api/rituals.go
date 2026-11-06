@@ -47,7 +47,8 @@ type RitualsHub interface {
 	Broadcast(channelID string, message []byte, excludeClientID string)
 	// DisconnectUserFromServer drops a removed member from one server and
 	// its channels without closing sockets (wire contract Item 3, D18).
-	DisconnectUserFromServer(userID, serverID string, channelIDs []string)
+	// A non-empty reason goes into the direct member_kicked frame.
+	DisconnectUserFromServer(userID, serverID string, channelIDs []string, reason string)
 	// SetSubscribeHook installs the per-subscribe replay of pending MLS
 	// remove requests (wire contract Item 2, D15).
 	SetSubscribeHook(fn func(ctx context.Context, channelID, userID string) [][]byte)
@@ -55,6 +56,10 @@ type RitualsHub interface {
 	// the device seat cap never retires those first (retireOldSeats). Read
 	// lock only, no I/O: safe inside the claim transaction.
 	ConnectedUsers(userIDs []string) map[string]bool
+	// SetServerActivityHook installs the per-connection server activity
+	// callback (subscribe, unsubscribe, disconnect), called outside the hub
+	// lock; Rituals keeps rituals.seats.last_active_at with it.
+	SetServerActivityHook(fn func(ctx context.Context, userID string, serverIDs []string))
 }
 
 // RitualsOptions wires the Rituals Spaces runtime (see EnableRituals).
@@ -139,6 +144,7 @@ func EnableRituals(opts RitualsOptions) (chi.Router, error) {
 	ritualsCurrent.Store(rt)
 	if rt.hub != nil {
 		rt.hub.SetSubscribeHook(rt.pendingRemovalFrames)
+		rt.hub.SetServerActivityHook(rt.touchSeatActivity)
 	}
 	return rt.routes(opts.JWTSecret), nil
 }
@@ -210,6 +216,15 @@ var ritualsSchemaSQL = []string{
 		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 		PRIMARY KEY (sp, user_id)
 	)`,
+	// The seat's last activity: set by every claim (new seat or re-open) and,
+	// throttled, when its Hush user's connection subscribes to the space's
+	// server, unsubscribes or disconnects (touchSeatActivity). The device cap
+	// retires the least recently active first (retireOldSeats). Nullable with
+	// no default and added here, not as a numbered migration, so the previous
+	// release still boots on this schema (dbcompat refuses a schema_migrations
+	// version past its own) and its inserts leave NULL. NULL means "never
+	// recorded": ranking falls back to the creation / device sign-in recency.
+	`ALTER TABLE rituals.seats ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ`,
 	`CREATE INDEX IF NOT EXISTS seats_sp_sub_idx ON rituals.seats (sp, sub)`,
 	`CREATE INDEX IF NOT EXISTS seats_user_id_idx ON rituals.seats (user_id)`,
 	// user_id is SET NULL on user deletion so a consumed jti stays consumed.

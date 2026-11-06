@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -230,7 +231,7 @@ func TestHub_DisconnectUserFromServer(t *testing.T) {
 		_ = drainAllMessages(c, 50*time.Millisecond)
 	}
 
-	hub.DisconnectUserFromServer("bob", "space-1", []string{"text-1", "voice-1"})
+	hub.DisconnectUserFromServer("bob", "space-1", []string{"text-1", "voice-1"}, "")
 
 	// The subscribed connection already got member_kicked from the server
 	// broadcast; only the other one gets it directly.
@@ -245,6 +246,7 @@ func TestHub_DisconnectUserFromServer(t *testing.T) {
 	require.Len(t, kicked, 1)
 	assert.Equal(t, "space-1", kicked[0]["server_id"])
 	assert.Equal(t, "bob", kicked[0]["user_id"])
+	assert.NotContains(t, kicked[0], "reason", "an empty reason is left out")
 	for _, raw := range drainAllMessages(bobIn, 50*time.Millisecond) {
 		assert.NotContains(t, string(raw), "member_kicked")
 	}
@@ -271,6 +273,102 @@ func TestHub_DisconnectUserFromServer(t *testing.T) {
 	assert.Empty(t, drainAllMessages(bobIn, 50*time.Millisecond))
 	assert.Empty(t, drainAllMessages(bobOut, 50*time.Millisecond))
 	assert.Len(t, drainAllMessages(alice, 50*time.Millisecond), 2) // presence change + broadcast
+}
+
+// Rituals fork: a connection that was not subscribed to the server missed
+// the broadcast member_kicked, so the direct frame must carry the reason
+// (device_limit for the device seat cap) for the client to tell a retired
+// device from a removed person.
+func TestHub_DisconnectUserFromServer_ReasonToUnsubscribed(t *testing.T) {
+	hub := NewHub()
+	bobIn := newTestClient(hub, "bob")  // subscribed to space-1
+	bobOut := newTestClient(hub, "bob") // never opened space-1
+	hub.Register(bobIn)
+	hub.Register(bobOut)
+	hub.SubscribeToServer(bobIn, "space-1")
+	_ = drainAllMessages(bobIn, 50*time.Millisecond)
+	_ = drainAllMessages(bobOut, 50*time.Millisecond)
+
+	hub.DisconnectUserFromServer("bob", "space-1", nil, "device_limit")
+
+	var kicked []map[string]interface{}
+	for _, raw := range drainAllMessages(bobOut, 50*time.Millisecond) {
+		var m map[string]interface{}
+		require.NoError(t, json.Unmarshal(raw, &m))
+		if m["type"] == "member_kicked" {
+			kicked = append(kicked, m)
+		}
+	}
+	require.Len(t, kicked, 1)
+	assert.Equal(t, map[string]interface{}{
+		"type":      "member_kicked",
+		"server_id": "space-1",
+		"user_id":   "bob",
+		"reason":    "device_limit",
+	}, kicked[0])
+	for _, raw := range drainAllMessages(bobIn, 50*time.Millisecond) {
+		assert.NotContains(t, string(raw), "member_kicked", "the subscribed one had the broadcast")
+	}
+}
+
+// Rituals fork: the server activity hook sees subscribe, unsubscribe and
+// disconnect of a local user's connection, with the hub lock released, and
+// never a federated connection or a no-op unsubscribe.
+func TestHub_ServerActivityHook(t *testing.T) {
+	hub := NewHub()
+	alice := newTestClient(hub, "alice")
+	fed := NewClient(nil, hub, "", "fed-device", "fed-identity", nil)
+	hub.Register(alice)
+	hub.Register(fed)
+
+	var calls []string
+	unlocked := true
+	hub.SetServerActivityHook(func(ctx context.Context, userID string, serverIDs []string) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("hook context has no deadline")
+		}
+		if hub.mu.TryLock() {
+			hub.mu.Unlock()
+		} else {
+			unlocked = false
+		}
+		sorted := append([]string(nil), serverIDs...)
+		sort.Strings(sorted)
+		calls = append(calls, userID+":"+strings.Join(sorted, ","))
+	})
+
+	hub.SubscribeToServer(alice, "space-1")
+	hub.SubscribeToServer(alice, "space-2")
+	hub.UnsubscribeFromServer(alice, "space-1")
+	hub.UnsubscribeFromServer(alice, "space-1") // not subscribed: no call
+	hub.SubscribeToServer(alice, "space-3")
+	hub.SubscribeToServer(fed, "space-1")
+	hub.UnsubscribeFromServer(fed, "space-1")
+	hub.Unregister(fed)
+	hub.Unregister(alice)
+	hub.Unregister(alice) // already gone: no call
+
+	assert.Equal(t, []string{
+		"alice:space-1",
+		"alice:space-2",
+		"alice:space-1",
+		"alice:space-3",
+		"alice:space-2,space-3", // disconnect: every server it was on
+	}, calls)
+	assert.True(t, unlocked, "the hook must run outside h.mu")
+
+	// No servers at disconnect: nothing to report.
+	bob := newTestClient(hub, "bob")
+	hub.Register(bob)
+	hub.Unregister(bob)
+	assert.Len(t, calls, 5)
+
+	hub.SetServerActivityHook(nil)
+	carol := newTestClient(hub, "carol")
+	hub.Register(carol)
+	hub.SubscribeToServer(carol, "space-1")
+	hub.Unregister(carol)
+	assert.Len(t, calls, 5)
 }
 
 func TestHub_SubscribeHookReplaysToSubscriberOnly(t *testing.T) {

@@ -7,7 +7,10 @@ package api
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,14 +75,40 @@ func ritualsIsMember(t *testing.T, s *ritualsTestSpace, uid string) bool {
 	return ok
 }
 
-// ritualsSeatAge backdates a seat so the retirement order is deterministic.
+// ritualsSeatAge backdates a seat's creation and last activity so the
+// retirement order is deterministic.
 func ritualsSeatAge(t *testing.T, s *ritualsTestSpace, uid string, ago time.Duration) {
 	t.Helper()
-	if _, err := s.pool.Exec(context.Background(),
-		`UPDATE rituals.seats SET created_at = now() - make_interval(secs => $3) WHERE sp = $1 AND user_id = $2`,
-		s.sp, uid, ago.Seconds()); err != nil {
+	ritualsSeatTimes(t, s, uid, ago, ago)
+}
+
+// ritualsSeatTimes sets a seat's created_at and last_active_at to now minus
+// created and active.
+func ritualsSeatTimes(t *testing.T, s *ritualsTestSpace, uid string, created, active time.Duration) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(), `
+		UPDATE rituals.seats SET created_at = now() - make_interval(secs => $3),
+		                         last_active_at = now() - make_interval(secs => $4)
+		WHERE sp = $1 AND user_id = $2`,
+		s.sp, uid, created.Seconds(), active.Seconds()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// ritualsLastActiveAgo is how long ago the seat's last_active_at is, or -1
+// when it is NULL.
+func ritualsLastActiveAgo(t *testing.T, s *ritualsTestSpace, uid string) time.Duration {
+	t.Helper()
+	var secs *float64
+	if err := s.pool.QueryRow(context.Background(), `
+		SELECT EXTRACT(EPOCH FROM now() - last_active_at)::float8 FROM rituals.seats WHERE sp = $1 AND user_id = $2`,
+		s.sp, uid).Scan(&secs); err != nil {
+		t.Fatal(err)
+	}
+	if secs == nil {
+		return -1
+	}
+	return time.Duration(*secs * float64(time.Second))
 }
 
 func ritualsSystemEvents(frames []map[string]interface{}) (events []string, actors []string) {
@@ -128,12 +157,10 @@ func TestRitualsDeviceCapRetiresLeastRecentDB(t *testing.T) {
 		ritualsSeatAge(t, s, uid, time.Duration(50-i*10)*time.Minute)
 		s.device(t, uid, "dev-"+uid[:8])
 	}
-	// The oldest seat signed in a moment ago, so the least recently active
-	// one is the second oldest.
-	if _, err := pool.Exec(ctx, `INSERT INTO device_keys (user_id, device_id, device_public_key, last_seen)
-		VALUES ($1, 'k1', '\x00', now())`, s.alice); err != nil {
-		t.Fatal(err)
-	}
+	// The oldest seat's device subscribed to the space a moment ago (the
+	// hub's server activity hook), so the least recently active one is the
+	// second oldest.
+	s.rt.touchSeatActivity(ctx, s.alice, []string{s.serverID})
 	stale := devices[1]
 	hub.take()
 
@@ -186,6 +213,11 @@ func TestRitualsDeviceCapRetiresLeastRecentDB(t *testing.T) {
 	if joined := ritualsFramesOfType(frames, "member_joined"); len(joined) != 1 {
 		t.Fatalf("member_joined frames = %d", len(joined))
 	}
+	// The deferred per-server disconnect carries the reason too, for a
+	// connection of the retired device that was not subscribed.
+	if got := hub.takeDisconnects(1, 3*time.Second); len(got) != 1 || got[0] != stale+"/"+s.serverID+"/device_limit" {
+		t.Fatalf("disconnects = %v", got)
+	}
 
 	// Re-opening on a device that still holds a seat retires nothing.
 	res, cerr, err = s.rt.claimSpace(ctx, s.alice, ritualsTestTicket(t, s.priv, s.now, s.sp, s.subA, "owner"))
@@ -214,8 +246,8 @@ func ritualsClaimRetires(t *testing.T, s *ritualsTestSpace, uid, sub string) *ri
 // The device cap spares a device in use and retires seats that never
 // finished joining first: a private window or wiped account that registered
 // (no MLS credential) or lost its member row, then the least recently active
-// by devices.last_seen too; only when every other seat is connected does it
-// fall back to the activity order.
+// by last_active_at; only when every other seat is connected does it fall
+// back to the activity order.
 func TestRitualsDeviceCapSparesConnectedDevicesDB(t *testing.T) {
 	pool, cleanup := db.SetupTestDB(t)
 	defer cleanup()
@@ -275,15 +307,13 @@ func TestRitualsDeviceCapSparesConnectedDevicesDB(t *testing.T) {
 	}
 	s.device(t, seventh, "dev-"+seventh[:8])
 
-	// 3. d1 registered a device a moment ago (devices.last_seen), so the least
-	// recently active unconnected seat is d3.
-	if err := pool.UpsertDevice(ctx, d1, "dev-"+d1[:8], ""); err != nil {
-		t.Fatal(err)
-	}
+	// 3. d1's connection unsubscribed a moment ago (the hub's server activity
+	// hook), so the least recently active unconnected seat is d3.
+	s.rt.touchSeatActivity(ctx, d1, []string{s.serverID})
 	eighth := s.user(t)
 	res = ritualsClaimRetires(t, s, eighth, s.subA)
 	if len(res.retired) != 1 || res.retired[0] != d3 {
-		t.Fatalf("retired %v, want %s (d1 is recent by devices.last_seen)", res.retired, d3)
+		t.Fatalf("retired %v, want %s (d1 is recent by last_active_at)", res.retired, d3)
 	}
 	s.device(t, eighth, "dev-"+eighth[:8])
 
@@ -334,7 +364,8 @@ func TestRitualsDeviceCapTrimsOverCapPersonDB(t *testing.T) {
 	}
 	for _, uid := range res.retired {
 		if uid == next || uid == s.alice {
-			// Alice's own seat is the newest by created_at here.
+			// The seven direct inserts have no MLS credentials and are past
+			// the join grace (unfinished); Alice's own seat is inside it.
 			t.Fatalf("retired %s", uid)
 		}
 	}
@@ -479,6 +510,15 @@ func TestRitualsSyncOneLeftLinePerPersonDB(t *testing.T) {
 			t.Fatalf("revoke kick has a reason: %v", f)
 		}
 	}
+	disconnects := hub.takeDisconnects(3, 3*time.Second)
+	if len(disconnects) != 3 {
+		t.Fatalf("disconnects = %v, want one per device", disconnects)
+	}
+	for _, d := range disconnects {
+		if !strings.HasSuffix(d, "/"+s.serverID+"/") {
+			t.Fatalf("revoke disconnect has a reason: %s", d)
+		}
+	}
 	events, actors := ritualsSystemEvents(frames)
 	if len(events) != 2 || events[0] != "member_left" || events[1] != "member_left" {
 		t.Fatalf("system events = %v", events)
@@ -486,5 +526,317 @@ func TestRitualsSyncOneLeftLinePerPersonDB(t *testing.T) {
 	sort.Strings(actors)
 	if actors[0] != want[0] || actors[1] != want[1] {
 		t.Fatalf("left line actors = %v", actors)
+	}
+}
+
+// ritualsFiveDevices gives alice four more seated devices (five in all, the
+// cap), each with an MLS credential, and returns them oldest seat first.
+func ritualsFiveDevices(t *testing.T, s *ritualsTestSpace) []string {
+	t.Helper()
+	devices := []string{s.alice}
+	for i := 0; i < 4; i++ {
+		uid := s.user(t)
+		s.claim(t, uid, s.subA, "member")
+		devices = append(devices, uid)
+	}
+	for i, uid := range devices {
+		ritualsSeatAge(t, s, uid, time.Duration(50-i*10)*time.Minute)
+		s.device(t, uid, "dev-"+uid[:8])
+	}
+	return devices
+}
+
+// Fix round 2: the cap ranks unconnected seats by last activity, not by when
+// the seat was made or the device last signed in. An old seat whose device
+// was in the space a minute ago stays; a newer one nobody opened since goes.
+func TestRitualsDeviceCapRanksByLastActiveDB(t *testing.T) {
+	pool, cleanup := db.SetupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	s := newRitualsTestSpace(t, pool) // alice (subA, owner) and bob (subB)
+	hub := &ritualsRecordingHub{connected: map[string]bool{}}
+	s.rt.hub = hub
+	s.rt.personSecret = ritualsPersonKeySecret("synthetic-jwt-secret-for-tests-only")
+	ritualsCurrent.Store(s.rt)
+	defer ritualsCurrent.Store(nil)
+
+	devices := ritualsFiveDevices(t, s)
+	alice, oldActive, d2, d3, newIdle := devices[0], devices[1], devices[2], devices[3], devices[4]
+	ritualsSeatTimes(t, s, alice, 50*time.Minute, 5*time.Minute)
+	// Seated three days ago, last in the space two hours ago, then its
+	// connection subscribed to the space just now.
+	ritualsSeatTimes(t, s, oldActive, 72*time.Hour, 2*time.Hour)
+	ritualsSeatTimes(t, s, d2, 30*time.Minute, 10*time.Minute)
+	ritualsSeatTimes(t, s, d3, 20*time.Minute, 10*time.Minute)
+	// Seated an hour ago and idle since: the newer seat, but the stalest.
+	ritualsSeatTimes(t, s, newIdle, time.Hour, time.Hour)
+	s.rt.touchSeatActivity(ctx, oldActive, []string{s.serverID})
+	if ago := ritualsLastActiveAgo(t, s, oldActive); ago < 0 || ago > 30*time.Second {
+		t.Fatalf("subscribe did not stamp last_active_at: %v ago", ago)
+	}
+	// Under the creation / sign-in recency the oldest seat would go.
+	var oldPick string
+	if err := pool.QueryRow(ctx, `
+		SELECT s.user_id::text FROM rituals.seats s WHERE s.sp = $1 AND s.sub = $2
+		ORDER BY GREATEST(s.created_at,
+		         (SELECT MAX(dk.last_seen) FROM device_keys dk WHERE dk.user_id = s.user_id),
+		         (SELECT MAX(d.last_seen) FROM devices d WHERE d.user_id = s.user_id)) LIMIT 1`,
+		s.sp, s.subA).Scan(&oldPick); err != nil || oldPick != oldActive {
+		t.Fatalf("setup: old ranking picks %s %v, want %s", oldPick, err, oldActive)
+	}
+
+	sixth := s.user(t)
+	res := ritualsClaimRetires(t, s, sixth, s.subA)
+	if len(res.retired) != 1 || res.retired[0] != newIdle {
+		t.Fatalf("retired %v, want the idle seat %s (not the old but active %s)", res.retired, newIdle, oldActive)
+	}
+	if ago := ritualsLastActiveAgo(t, s, sixth); ago < 0 || ago > 30*time.Second {
+		t.Fatalf("a new seat starts active now: %v ago", ago)
+	}
+
+	// Inside the connected tier the same order holds: everyone online, the
+	// least recently active connected seat goes (d2, d3 tie at 10 minutes and
+	// the older seat breaks it).
+	for _, uid := range ritualsSeatsOf(t, s, s.subA) {
+		hub.connected[uid] = true
+	}
+	s.device(t, sixth, "dev-"+sixth[:8])
+	res = ritualsClaimRetires(t, s, s.user(t), s.subA)
+	if len(res.retired) != 1 || res.retired[0] != d2 {
+		t.Fatalf("connected tier retired %v, want %s", res.retired, d2)
+	}
+}
+
+// Fix round 2: claims and the hub's server activity hook stamp
+// last_active_at; the hook only rewrites a value older than the throttle,
+// only for that user's seats in the given servers, and ignores bad ids.
+func TestRitualsSeatActivityTouchDB(t *testing.T) {
+	pool, cleanup := db.SetupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	s := newRitualsTestSpace(t, pool) // alice (subA, owner) and bob (subB)
+	hub := &ritualsRecordingHub{}
+	s.rt.hub = hub
+	ritualsCurrent.Store(s.rt)
+	defer ritualsCurrent.Store(nil)
+
+	// A re-open of an existing seat counts as activity.
+	ritualsSeatAge(t, s, s.alice, time.Hour)
+	s.claim(t, s.alice, s.subA, "owner")
+	if ago := ritualsLastActiveAgo(t, s, s.alice); ago < 0 || ago > 30*time.Second {
+		t.Fatalf("re-open did not stamp last_active_at: %v ago", ago)
+	}
+
+	// Throttle: 30 s old stays, 90 s old (or NULL) is rewritten.
+	ritualsSeatAge(t, s, s.alice, 30*time.Second)
+	ritualsSeatAge(t, s, s.bob, time.Hour)
+	s.rt.touchSeatActivity(ctx, s.alice, []string{s.serverID})
+	if ago := ritualsLastActiveAgo(t, s, s.alice); ago < 25*time.Second {
+		t.Fatalf("a 30 s old value was rewritten (%v ago)", ago)
+	}
+	if ago := ritualsLastActiveAgo(t, s, s.bob); ago < 50*time.Minute {
+		t.Fatalf("another user's seat was touched (%v ago)", ago)
+	}
+	ritualsSeatAge(t, s, s.alice, 90*time.Second)
+	s.rt.touchSeatActivity(ctx, s.alice, []string{"not-a-uuid", s.serverID})
+	if ago := ritualsLastActiveAgo(t, s, s.alice); ago < 0 || ago > 30*time.Second {
+		t.Fatalf("a 90 s old value was not rewritten (%v ago)", ago)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE rituals.seats SET last_active_at = NULL WHERE sp = $1 AND user_id = $2`, s.sp, s.bob); err != nil {
+		t.Fatal(err)
+	}
+	s.rt.touchSeatActivity(ctx, "not-a-uuid", []string{s.serverID})
+	s.rt.touchSeatActivity(ctx, s.bob, []string{"not-a-uuid"})
+	s.rt.touchSeatActivity(ctx, s.bob, nil)
+	if ago := ritualsLastActiveAgo(t, s, s.bob); ago != -1 {
+		t.Fatalf("bad ids touched a seat (%v ago)", ago)
+	}
+	// Another space's server id does not touch this space's seat.
+	other := newRitualsTestSpace(t, pool)
+	s.rt.touchSeatActivity(ctx, s.bob, []string{other.serverID})
+	if ago := ritualsLastActiveAgo(t, s, s.bob); ago != -1 {
+		t.Fatalf("another server's activity touched this seat (%v ago)", ago)
+	}
+	s.rt.touchSeatActivity(ctx, s.bob, []string{other.serverID, s.serverID})
+	if ago := ritualsLastActiveAgo(t, s, s.bob); ago < 0 || ago > 30*time.Second {
+		t.Fatalf("NULL was not stamped (%v ago)", ago)
+	}
+	// A cancelled context is logged and dropped, never returned or panicked.
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	s.rt.touchSeatActivity(cctx, s.alice, []string{s.serverID})
+
+	// EnableRituals installs the hook on the hub.
+	ritualsCurrent.Store(nil)
+	pub := s.priv.Public().(ed25519.PublicKey)
+	if _, err := EnableRituals(RitualsOptions{
+		SpaceOrigin:     "https://space.rit.al",
+		TicketPublicKey: base64.RawURLEncoding.EncodeToString(pub),
+		Pool:            pool,
+		Hub:             hub,
+		JWTSecret:       "synthetic-jwt-secret-for-tests-only",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer DisableRituals()
+	hub.mu.Lock()
+	hook := hub.activityHook
+	hub.mu.Unlock()
+	if hook == nil {
+		t.Fatal("EnableRituals did not install the server activity hook")
+	}
+	ritualsSeatAge(t, s, s.bob, time.Hour)
+	hook(ctx, s.bob, []string{s.serverID})
+	if ago := ritualsLastActiveAgo(t, s, s.bob); ago < 0 || ago > 30*time.Second {
+		t.Fatalf("installed hook did not stamp (%v ago)", ago)
+	}
+}
+
+// Fix round 2: a seat without its MLS credential or member row is only
+// "never finished joining" once it is older than ritualsSeatJoinGrace; a
+// device still registering ranks as an ordinary unconnected seat.
+func TestRitualsDeviceCapJoinGraceDB(t *testing.T) {
+	pool, cleanup := db.SetupTestDB(t)
+	defer cleanup()
+	s := newRitualsTestSpace(t, pool) // alice (subA, owner) and bob (subB)
+	hub := &ritualsRecordingHub{connected: map[string]bool{}}
+	s.rt.hub = hub
+	ritualsCurrent.Store(s.rt)
+	defer ritualsCurrent.Store(nil)
+
+	devices := []string{s.alice}
+	for i := 0; i < 4; i++ {
+		uid := s.user(t)
+		s.claim(t, uid, s.subA, "member")
+		devices = append(devices, uid)
+	}
+	alice, d1, joining := devices[0], devices[1], devices[4]
+	for i, uid := range devices {
+		ritualsSeatAge(t, s, uid, time.Duration(50-i*10)*time.Minute)
+		if uid != joining {
+			s.device(t, uid, "dev-"+uid[:8])
+		}
+	}
+	// The newest device claimed 30 s ago and has not uploaded its MLS
+	// credential yet; the laptop is online.
+	ritualsSeatAge(t, s, joining, 30*time.Second)
+	hub.connected[alice] = true
+
+	res := ritualsClaimRetires(t, s, s.user(t), s.subA)
+	if len(res.retired) != 1 || res.retired[0] != d1 {
+		t.Fatalf("retired %v, want the least recently active %s, not the joining %s", res.retired, d1, joining)
+	}
+
+	// Past the grace without a credential it is unfinished and goes first,
+	// although it is the most recently active unconnected seat.
+	ritualsSeatTimes(t, s, joining, ritualsSeatJoinGrace+time.Minute, 0)
+	res = ritualsClaimRetires(t, s, s.user(t), s.subA)
+	if len(res.retired) != 1 || res.retired[0] != joining {
+		t.Fatalf("retired %v, want the unfinished %s", res.retired, joining)
+	}
+}
+
+// Fix round 2 schema: last_active_at is added by the Rituals ensure list,
+// nullable with no default, so a database from before it (or rows a
+// previous release inserts) keep NULL; NULL ranks by the older recency
+// (creation / device sign-in), and the statement is idempotent.
+func TestRitualsSeatLastActiveColumnDB(t *testing.T) {
+	pool, cleanup := db.SetupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	s := newRitualsTestSpace(t, pool) // alice (subA, owner) and bob (subB)
+	hub := &ritualsRecordingHub{connected: map[string]bool{}}
+	s.rt.hub = hub
+	ritualsCurrent.Store(s.rt)
+	defer ritualsCurrent.Store(nil)
+
+	// The schema before this change: no column. Restore it whatever happens
+	// (deferred after cleanup, so it runs before the pool closes).
+	defer func() {
+		if err := RitualsBootstrap(context.Background(), pool); err != nil {
+			t.Errorf("restore schema: %v", err)
+		}
+	}()
+	if _, err := pool.Exec(ctx, `ALTER TABLE rituals.seats DROP COLUMN last_active_at`); err != nil {
+		t.Fatal(err)
+	}
+	// The previous release's seat insert, verbatim, works on both schemas.
+	oldInsert := `INSERT INTO rituals.seats (sp, sub, user_id) VALUES ($1, $2, $3)`
+	before := s.user(t)
+	if _, err := pool.Exec(ctx, oldInsert, s.sp, s.subA, before); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := RitualsBootstrap(ctx, pool); err != nil {
+			t.Fatalf("bootstrap %d: %v", i, err)
+		}
+	}
+	var dataType, nullable string
+	var def *string
+	if err := pool.QueryRow(ctx, `
+		SELECT data_type, is_nullable, column_default FROM information_schema.columns
+		WHERE table_schema = 'rituals' AND table_name = 'seats' AND column_name = 'last_active_at'`).
+		Scan(&dataType, &nullable, &def); err != nil {
+		t.Fatal(err)
+	}
+	if dataType != "timestamp with time zone" || nullable != "YES" || def != nil {
+		t.Fatalf("column = %s nullable %s default %v", dataType, nullable, def)
+	}
+	var stamped int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM rituals.seats WHERE sp = $1 AND last_active_at IS NOT NULL`, s.sp).Scan(&stamped); err != nil || stamped != 0 {
+		t.Fatalf("pre-existing seats got a value: %d %v", stamped, err)
+	}
+	after := s.user(t)
+	if _, err := pool.Exec(ctx, oldInsert, s.sp, s.subA, after); err != nil {
+		t.Fatalf("previous release insert on the new schema: %v", err)
+	}
+	if ritualsLastActiveAgo(t, s, after) != -1 {
+		t.Fatal("previous release insert got a last_active_at")
+	}
+	// A recorded value survives a restart (the ensure list is idempotent).
+	ritualsSeatAge(t, s, s.alice, 5*time.Minute)
+	if err := RitualsBootstrap(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if ago := ritualsLastActiveAgo(t, s, s.alice); ago < 4*time.Minute || ago > 6*time.Minute {
+		t.Fatalf("restart changed last_active_at (%v ago)", ago)
+	}
+
+	// Ranking with NULLs: alice (recorded 5 min ago), before/after (NULL),
+	// plus two more NULL seats; NULL falls back to the latest of creation and
+	// device sign-in. Everyone has a credential, nobody is connected.
+	more := []string{s.user(t), s.user(t)}
+	for _, uid := range more {
+		if _, err := pool.Exec(ctx, oldInsert, s.sp, s.subA, uid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, uid := range append([]string{s.alice, before, after}, more...) {
+		s.device(t, uid, "dev-"+uid[:8])
+		if _, err := pool.Exec(ctx, `INSERT INTO server_members (server_id, user_id, permission_level) VALUES ($1, $2, 0)
+			ON CONFLICT DO NOTHING`, s.serverID, uid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setCreated := func(uid string, ago time.Duration) {
+		if _, err := pool.Exec(ctx, `UPDATE rituals.seats SET created_at = now() - make_interval(secs => $3)
+			WHERE sp = $1 AND user_id = $2`, s.sp, uid, ago.Seconds()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setCreated(before, 3*time.Hour) // oldest seat, but signed in just now
+	setCreated(after, 2*time.Hour)  // the stalest by the fallback
+	setCreated(more[0], time.Hour)
+	setCreated(more[1], time.Hour)
+	if _, err := pool.Exec(ctx, `INSERT INTO device_keys (user_id, device_id, device_public_key, last_seen)
+		VALUES ($1, 'k1', '\x00', now())`, before); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(ritualsSeatsOf(t, s, s.subA)); got != ritualsSeatsPerPerson {
+		t.Fatalf("setup seats = %d", got)
+	}
+	res := ritualsClaimRetires(t, s, s.user(t), s.subA)
+	if len(res.retired) != 1 || res.retired[0] != after {
+		t.Fatalf("retired %v, want %s (NULL ranks by creation / sign-in)", res.retired, after)
 	}
 }
