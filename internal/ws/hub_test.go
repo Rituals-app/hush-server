@@ -323,10 +323,7 @@ func TestHub_ServerActivityHook(t *testing.T) {
 
 	var calls []string
 	unlocked := true
-	hub.SetServerActivityHook(func(ctx context.Context, userID string, serverIDs []string) {
-		if _, ok := ctx.Deadline(); !ok {
-			t.Error("hook context has no deadline")
-		}
+	hub.SetServerActivityHook(func(userID string, serverIDs []string) {
 		if hub.mu.TryLock() {
 			hub.mu.Unlock()
 		} else {
@@ -369,6 +366,45 @@ func TestHub_ServerActivityHook(t *testing.T) {
 	hub.SubscribeToServer(carol, "space-1")
 	hub.Unregister(carol)
 	assert.Len(t, calls, 5)
+}
+
+// Rituals fork: Subscribe, Unsubscribe and Unregister release h.mu by defer.
+// A peer whose read pump already closed its send channel (Client.readPump
+// closes it before Run's deferred Unregister) makes the presence refresh
+// panic; chi's Recoverer catches that, and the hub must not stay locked.
+func TestHub_LockReleasedWhenPresenceSendPanics(t *testing.T) {
+	cases := map[string]func(hub *Hub, alice *Client){
+		"subscribe":   func(hub *Hub, alice *Client) { hub.SubscribeToServer(alice, "space-1") },
+		"unsubscribe": func(hub *Hub, alice *Client) { hub.UnsubscribeFromServer(alice, "space-1") },
+		"unregister":  func(hub *Hub, alice *Client) { hub.Unregister(alice) },
+	}
+	for name, act := range cases {
+		t.Run(name, func(t *testing.T) {
+			hub := NewHub()
+			alice := newTestClient(hub, "alice")
+			bob := newTestClient(hub, "bob")
+			hub.Register(alice)
+			hub.Register(bob)
+			hooked := false
+			hub.SetServerActivityHook(func(string, []string) { hooked = true })
+			hub.SubscribeToServer(bob, "space-1")
+			if name != "subscribe" {
+				hub.SubscribeToServer(alice, "space-1")
+			}
+			hooked = false
+			close(bob.send) // bob's read pump has returned; Unregister not yet run
+
+			assert.Panics(t, func() { act(hub, alice) }, "the send to bob's closed channel panics")
+			require.True(t, hub.mu.TryLock(), "h.mu stayed locked after the panic")
+			hub.mu.Unlock()
+			assert.False(t, hooked, "no activity is reported for a call that panicked")
+			// The hub still serves other connections.
+			carol := newTestClient(hub, "carol")
+			hub.Register(carol)
+			hub.SubscribeToServer(carol, "space-2")
+			hub.Unregister(carol)
+		})
+	}
 }
 
 func TestHub_SubscribeHookReplaysToSubscriberOnly(t *testing.T) {

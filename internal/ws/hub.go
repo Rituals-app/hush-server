@@ -6,14 +6,9 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
-
-// serverActivityTimeout bounds one call of the server activity hook, which
-// runs on the connection's own goroutine (see SetServerActivityHook).
-const serverActivityTimeout = 3 * time.Second
 
 // Hub holds all connected clients, channel subscriptions, and guild subscriptions.
 type Hub struct {
@@ -29,7 +24,7 @@ type Hub struct {
 	// Rituals fork: called outside h.mu after a local user's connection
 	// subscribes to, unsubscribes from or disconnects while subscribed to
 	// servers (see SetServerActivityHook).
-	serverActivityHook func(ctx context.Context, userID string, serverIDs []string)
+	serverActivityHook func(userID string, serverIDs []string)
 }
 
 // NewHub creates a new Hub.
@@ -64,10 +59,19 @@ func (h *Hub) Register(c *Client) {
 // Rituals fork: the servers c was subscribed to are reported to the server
 // activity hook after the lock is released.
 func (h *Hub) Unregister(c *Client) {
+	if left, ok := h.unregister(c); ok {
+		h.noteServerActivity(c, left)
+	}
+}
+
+// unregister is Unregister under h.mu, released by defer so a panic in a
+// send (a peer whose send channel its read pump already closed) can never
+// leave the hub locked. It returns the servers c was subscribed to.
+func (h *Hub) unregister(c *Client) ([]string, bool) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if _, ok := h.clients[c.id]; !ok {
-		h.mu.Unlock()
-		return
+		return nil, false
 	}
 	left := make([]string, 0, len(c.servers))
 	for serverID := range c.servers {
@@ -93,8 +97,7 @@ func (h *Hub) Unregister(c *Client) {
 	}
 	c.servers = nil
 	h.refreshPresenceLocked(peers)
-	h.mu.Unlock()
-	h.noteServerActivity(c, left)
+	return left, true
 }
 
 // hasOtherClientForUser returns true if any remaining client belongs to the given userID.
@@ -145,7 +148,15 @@ func (h *Hub) Unsubscribe(c *Client, channelID string) {
 // Rituals fork: then reports serverID to the server activity hook, outside
 // the lock.
 func (h *Hub) SubscribeToServer(c *Client, serverID string) {
+	h.subscribeToServer(c, serverID)
+	h.noteServerActivity(c, []string{serverID})
+}
+
+// subscribeToServer is SubscribeToServer under h.mu (released by defer, as in
+// unregister).
+func (h *Hub) subscribeToServer(c *Client, serverID string) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.servers[serverID] == nil {
 		h.servers[serverID] = make(map[string]*Client)
 	}
@@ -155,24 +166,29 @@ func (h *Hub) SubscribeToServer(c *Client, serverID string) {
 	}
 	c.servers[serverID] = struct{}{}
 	h.refreshPresenceLocked(h.serverClientsLocked(serverID))
-	h.mu.Unlock()
-	h.noteServerActivity(c, []string{serverID})
 }
 
 // UnsubscribeFromServer removes the client from the server's subscriber set.
 // Rituals fork: when c was subscribed, serverID then goes to the server
 // activity hook, outside the lock.
 func (h *Hub) UnsubscribeFromServer(c *Client, serverID string) {
+	if h.unsubscribeFromServer(c, serverID) {
+		h.noteServerActivity(c, []string{serverID})
+	}
+}
+
+// unsubscribeFromServer is UnsubscribeFromServer under h.mu (released by
+// defer, as in unregister); it reports whether c was subscribed.
+func (h *Hub) unsubscribeFromServer(c *Client, serverID string) bool {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if _, ok := h.servers[serverID][c.id]; !ok {
-		h.mu.Unlock()
-		return
+		return false
 	}
 	affected := h.serverClientsLocked(serverID)
 	h.unsubscribeServerLocked(c, serverID)
 	h.refreshPresenceLocked(affected)
-	h.mu.Unlock()
-	h.noteServerActivity(c, []string{serverID})
+	return true
 }
 
 // unsubscribeServerLocked drops c from serverID's set. Caller holds h.mu.
@@ -259,12 +275,13 @@ func (h *Hub) subscribeHookFn() func(ctx context.Context, channelID, userID stri
 // SetServerActivityHook installs fn, called with a local user's id and the
 // server ids involved after that user's connection subscribes to a server,
 // unsubscribes from one it was subscribed to, or unregisters while
-// subscribed to some. It runs on the caller's goroutine after h.mu is
-// released, never under it, with a context bounded by serverActivityTimeout;
-// fn must be best effort and must not call back into the hub's write paths.
-// Federated connections are not reported. Rituals uses it to keep each
-// device seat's last activity (rituals.seats.last_active_at). nil removes it.
-func (h *Hub) SetServerActivityHook(fn func(ctx context.Context, userID string, serverIDs []string)) {
+// subscribed to some. It runs on that connection's goroutine (its read pump,
+// or Run's deferred Unregister) after h.mu is released, never under it, so
+// fn must return at once: no I/O there (hand it off), and no call back into
+// the hub's write paths. Federated connections are not reported. Rituals
+// uses it to keep each device seat's last activity
+// (rituals.seats.last_active_at). nil removes it.
+func (h *Hub) SetServerActivityHook(fn func(userID string, serverIDs []string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.serverActivityHook = fn
@@ -282,9 +299,7 @@ func (h *Hub) noteServerActivity(c *Client, serverIDs []string) {
 	if fn == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), serverActivityTimeout)
-	defer cancel()
-	fn(ctx, c.userID, serverIDs)
+	fn(c.userID, serverIDs)
 }
 
 // BroadcastToServer sends the message to all clients subscribed to the given server.

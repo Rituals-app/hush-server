@@ -686,9 +686,155 @@ func TestRitualsSeatActivityTouchDB(t *testing.T) {
 		t.Fatal("EnableRituals did not install the server activity hook")
 	}
 	ritualsSeatAge(t, s, s.bob, time.Hour)
-	hook(ctx, s.bob, []string{s.serverID})
-	if ago := ritualsLastActiveAgo(t, s, s.bob); ago < 0 || ago > 30*time.Second {
-		t.Fatalf("installed hook did not stamp (%v ago)", ago)
+	hook(s.bob, []string{s.serverID})
+	ritualsWaitStamped(t, s, s.bob)
+
+	// Fix round 3: the hook never waits on the database. With every worker
+	// busy it returns at once and writes nothing, and it does not remember
+	// the pair, so the next event writes it.
+	gate := &s.rt.seatActivity
+	ritualsWaitIdle(t, gate)
+	for i := 0; i < ritualsSeatActivityWorkers; i++ {
+		if gate.admit("busy", []string{string(rune('a' + i))}, time.Now()) == nil {
+			t.Fatal("setup: a free worker was refused")
+		}
+	}
+	ritualsSeatAge(t, s, s.alice, time.Hour)
+	started := time.Now()
+	s.rt.noteSeatActivity(s.alice, []string{s.serverID})
+	if took := time.Since(started); took > 100*time.Millisecond {
+		t.Fatalf("the hook blocked for %v", took)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if ago := ritualsLastActiveAgo(t, s, s.alice); ago < 50*time.Minute {
+		t.Fatalf("a dropped event was written (%v ago)", ago)
+	}
+	for i := 0; i < ritualsSeatActivityWorkers; i++ {
+		gate.release()
+	}
+	s.rt.noteSeatActivity(s.alice, []string{s.serverID})
+	ritualsWaitStamped(t, s, s.alice)
+}
+
+// ritualsWaitIdle waits for the gate's background writes to finish.
+func ritualsWaitIdle(t *testing.T, g *ritualsSeatActivityGate) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		g.mu.Lock()
+		n := g.inFlight
+		g.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d activity writes still in flight", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// ritualsWaitStamped waits for the background activity write to stamp uid.
+func ritualsWaitStamped(t *testing.T, s *ritualsTestSpace, uid string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if ago := ritualsLastActiveAgo(t, s, uid); ago >= 0 && ago <= 30*time.Second {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("seat %s was not stamped (%v ago)", uid, ritualsLastActiveAgo(t, s, uid))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// Fix round 3: the in-memory gate in front of the activity write.
+func TestRitualsSeatActivityGate(t *testing.T) {
+	var g ritualsSeatActivityGate
+	now := time.Now()
+	if due := g.admit("u1", []string{"s1", "s2"}, now); strings.Join(due, ",") != "s1,s2" {
+		t.Fatalf("first event: %v", due)
+	}
+	g.release()
+	// Inside the throttle the same pair is not due; another server or user is.
+	if due := g.admit("u1", []string{"s1"}, now.Add(30*time.Second)); due != nil {
+		t.Fatalf("throttled pair admitted: %v", due)
+	}
+	if due := g.admit("u1", []string{"s1", "s3"}, now.Add(30*time.Second)); strings.Join(due, ",") != "s3" {
+		t.Fatalf("mixed event: %v", due)
+	}
+	g.release()
+	if due := g.admit("u2", []string{"s1"}, now.Add(30*time.Second)); strings.Join(due, ",") != "s1" {
+		t.Fatalf("another user: %v", due)
+	}
+	g.release()
+	// After the throttle it is due again.
+	if due := g.admit("u1", []string{"s1"}, now.Add(ritualsSeatActivityThrottle)); strings.Join(due, ",") != "s1" {
+		t.Fatalf("after the throttle: %v", due)
+	}
+	g.release()
+	// At most ritualsSeatActivityWorkers in flight; a refused event is not
+	// remembered.
+	for i := 0; i < ritualsSeatActivityWorkers; i++ {
+		if g.admit("w", []string{string(rune('a' + i))}, now) == nil {
+			t.Fatalf("worker %d refused", i)
+		}
+	}
+	if due := g.admit("u3", []string{"s1"}, now); due != nil {
+		t.Fatalf("over the worker bound: %v", due)
+	}
+	g.release()
+	if due := g.admit("u3", []string{"s1"}, now); strings.Join(due, ",") != "s1" {
+		t.Fatalf("a refused event was remembered: %v", due)
+	}
+	for i := 0; i < ritualsSeatActivityWorkers; i++ {
+		g.release()
+	}
+	if g.inFlight != 0 {
+		t.Fatalf("inFlight = %d", g.inFlight)
+	}
+	// The memory is bounded: when full it starts over.
+	for i := 0; len(g.seen) < ritualsSeatActivityMemo; i++ {
+		g.admit("m", []string{time.Duration(i).String()}, now)
+		g.release()
+	}
+	g.admit("m", []string{"one-more"}, now)
+	g.release()
+	if len(g.seen) != 1 {
+		t.Fatalf("memo size after overflow = %d, want 1", len(g.seen))
+	}
+}
+
+// Fix round 3: a fresh device sign-in is never hidden behind an older
+// last_active_at stamp (the ranking takes the latest of all four signals).
+func TestRitualsDeviceCapFreshSignInBeatsStaleStampDB(t *testing.T) {
+	pool, cleanup := db.SetupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	s := newRitualsTestSpace(t, pool) // alice (subA, owner) and bob (subB)
+	hub := &ritualsRecordingHub{connected: map[string]bool{}}
+	s.rt.hub = hub
+	s.rt.personSecret = ritualsPersonKeySecret("synthetic-jwt-secret-for-tests-only")
+	ritualsCurrent.Store(s.rt)
+	defer ritualsCurrent.Store(nil)
+
+	devices := ritualsFiveDevices(t, s)
+	alice, signedIn, d2, d3, idle := devices[0], devices[1], devices[2], devices[3], devices[4]
+	ritualsSeatTimes(t, s, alice, 50*time.Minute, 5*time.Minute)
+	// Stamped three hours ago, but its device signed in a minute ago.
+	ritualsSeatTimes(t, s, signedIn, 3*time.Hour, 3*time.Hour)
+	if _, err := pool.Exec(ctx, `INSERT INTO device_keys (user_id, device_id, device_public_key, last_seen)
+		VALUES ($1, 'k1', '\x00', now() - interval '1 minute')`, signedIn); err != nil {
+		t.Fatal(err)
+	}
+	ritualsSeatTimes(t, s, d2, 30*time.Minute, 30*time.Minute)
+	ritualsSeatTimes(t, s, d3, 20*time.Minute, 20*time.Minute)
+	ritualsSeatTimes(t, s, idle, 2*time.Hour, 2*time.Hour)
+
+	res := ritualsClaimRetires(t, s, s.user(t), s.subA)
+	if len(res.retired) != 1 || res.retired[0] != idle {
+		t.Fatalf("retired %v, want the idle seat %s (not %s, signed in a minute ago)", res.retired, idle, signedIn)
 	}
 }
 

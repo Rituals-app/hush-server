@@ -19,7 +19,6 @@ import (
 
 	"github.com/hushhq/hush-server/internal/models"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -48,13 +47,6 @@ const (
 	// (retireOldSeats tier 1): a device that is still registering or joining
 	// counts as an ordinary unconnected seat until then.
 	ritualsSeatJoinGrace = 2 * time.Minute
-	// ritualsSeatActivityThrottle: a WebSocket subscribe, unsubscribe or
-	// disconnect rewrites rituals.seats.last_active_at only when the stored
-	// value is older than this (touchSeatActivity), so a reconnecting tab
-	// costs at most one row write per seat per interval.
-	ritualsSeatActivityThrottle = 60 * time.Second
-	// ritualsSeatActivityTimeout bounds one best-effort activity write.
-	ritualsSeatActivityTimeout = 2 * time.Second
 )
 
 // ritualsTemplate is the channel set of a new space: upstream's system
@@ -401,14 +393,15 @@ func ritualsPeopleCount(ctx context.Context, tx pgx.Tx, sp, serverID string) (in
 //     still joining is not taken for an abandoned one;
 //  3. then the other unconnected seats, least recently active first.
 //
-// Activity is rituals.seats.last_active_at: set by every claim of the seat
-// (a new seat or a re-open) and, throttled to ritualsSeatActivityThrottle,
-// when its Hush user's connection subscribes to this server, unsubscribes or
-// disconnects (touchSeatActivity). A NULL (a seat no activity was recorded
-// for since the column was added, or one a previous release inserted) falls
-// back to the older recency: the latest of the seat's creation and its Hush
-// user's last device sign-in or device registration (device_keys.last_seen,
-// set on every challenge login; devices.last_seen, set on credential upload).
+// A seat's activity is the latest of: rituals.seats.last_active_at (set by
+// every claim of the seat, a new seat or a re-open, and, throttled to
+// ritualsSeatActivityThrottle, when its Hush user's connection subscribes to
+// this server, unsubscribes or disconnects: rituals_activity.go), the seat's
+// creation, and its Hush user's last device sign-in or device registration
+// (device_keys.last_seen, set on every challenge login; devices.last_seen,
+// set on credential upload). GREATEST skips NULLs, so a seat no activity was
+// stamped for (one a previous release inserted) ranks by the other three,
+// and a fresh sign-in is never hidden behind an older stamp.
 //
 // If not enough unconnected seats exist (every candidate is connected), the
 // rest come from the connected seats in the same activity order: the cap
@@ -427,12 +420,11 @@ func (rt *ritualsRuntime) retireOldSeats(ctx context.Context, tx pgx.Tx, t *ritu
 		              OR NOT EXISTS (SELECT 1 FROM mls_credentials mc WHERE mc.user_id = s.user_id))
 		FROM rituals.seats s
 		WHERE s.sp = $1 AND s.sub = $2 AND s.user_id <> $3
-		ORDER BY COALESCE(
+		ORDER BY GREATEST(
 		           s.last_active_at,
-		           GREATEST(
-		             s.created_at,
-		             (SELECT MAX(dk.last_seen) FROM device_keys dk WHERE dk.user_id = s.user_id),
-		             (SELECT MAX(d.last_seen) FROM devices d WHERE d.user_id = s.user_id))),
+		           s.created_at,
+		           (SELECT MAX(dk.last_seen) FROM device_keys dk WHERE dk.user_id = s.user_id),
+		           (SELECT MAX(d.last_seen) FROM devices d WHERE d.user_id = s.user_id)),
 		         s.created_at, s.user_id`, t.Sp, t.Sub, userID, res.serverID, ritualsSeatJoinGrace.Seconds())
 	if err != nil {
 		return err
@@ -485,40 +477,6 @@ func (rt *ritualsRuntime) retireOldSeats(ctx context.Context, tx pgx.Tx, t *ritu
 	res.retired = retired
 	res.retiredMembers, err = ritualsDropMembers(ctx, tx, res.serverID, retired)
 	return err
-}
-
-// touchSeatActivity is the hub's server activity hook (EnableRituals): a
-// connection of userID subscribed to, unsubscribed from or disconnected from
-// serverIDs. It stamps last_active_at on that user's seats in those servers'
-// spaces, only where the stored value is NULL or older than
-// ritualsSeatActivityThrottle. The hub calls it on the connection's goroutine
-// and outside the hub lock; it is best effort: an error is logged, never
-// returned, and the WebSocket path carries on.
-func (rt *ritualsRuntime) touchSeatActivity(ctx context.Context, userID string, serverIDs []string) {
-	if _, err := uuid.Parse(userID); err != nil {
-		return
-	}
-	ids := make([]string, 0, len(serverIDs))
-	for _, id := range serverIDs {
-		if _, err := uuid.Parse(id); err == nil {
-			ids = append(ids, id)
-		}
-	}
-	if len(ids) == 0 || rt.pool == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(ctx, ritualsSeatActivityTimeout)
-	defer cancel()
-	if _, err := rt.pool.Exec(ctx, `
-		UPDATE rituals.seats s SET last_active_at = now()
-		FROM rituals.spaces sp
-		WHERE sp.server_id = ANY($2::uuid[])
-		  AND s.sp = sp.sp
-		  AND s.user_id = $1
-		  AND (s.last_active_at IS NULL OR s.last_active_at < now() - make_interval(secs => $3))`,
-		userID, ids, ritualsSeatActivityThrottle.Seconds()); err != nil {
-		slog.Warn("rituals: seat activity", "err", err)
-	}
 }
 
 // ritualsDropMembers deletes the member rows of users whose seats were just

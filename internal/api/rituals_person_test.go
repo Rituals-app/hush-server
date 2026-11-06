@@ -54,7 +54,7 @@ type ritualsRecordingHub struct {
 	// disconnects records DisconnectUserFromServer calls as
 	// "user/server/reason"; activityHook is the installed activity hook.
 	disconnects  []string
-	activityHook func(context.Context, string, []string)
+	activityHook func(string, []string)
 }
 
 func (h *ritualsRecordingHub) record(message []byte) {
@@ -77,7 +77,7 @@ func (h *ritualsRecordingHub) DisconnectUserFromServer(userID, serverID string, 
 }
 func (h *ritualsRecordingHub) SetSubscribeHook(func(context.Context, string, string) [][]byte) {
 }
-func (h *ritualsRecordingHub) SetServerActivityHook(fn func(context.Context, string, []string)) {
+func (h *ritualsRecordingHub) SetServerActivityHook(fn func(string, []string)) {
 	h.mu.Lock()
 	h.activityHook = fn
 	h.mu.Unlock()

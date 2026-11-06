@@ -57,9 +57,10 @@ type RitualsHub interface {
 	// lock only, no I/O: safe inside the claim transaction.
 	ConnectedUsers(userIDs []string) map[string]bool
 	// SetServerActivityHook installs the per-connection server activity
-	// callback (subscribe, unsubscribe, disconnect), called outside the hub
-	// lock; Rituals keeps rituals.seats.last_active_at with it.
-	SetServerActivityHook(fn func(ctx context.Context, userID string, serverIDs []string))
+	// callback (subscribe, unsubscribe, disconnect), called on the
+	// connection's goroutine outside the hub lock, so it must not block;
+	// Rituals keeps rituals.seats.last_active_at with it (rituals_activity.go).
+	SetServerActivityHook(fn func(userID string, serverIDs []string))
 }
 
 // RitualsOptions wires the Rituals Spaces runtime (see EnableRituals).
@@ -81,6 +82,8 @@ type ritualsRuntime struct {
 	now         func() time.Time
 	// personSecret keys the per-Space person key (rituals_person.go).
 	personSecret []byte
+	// seatActivity gates the hub's activity hook (rituals_activity.go).
+	seatActivity ritualsSeatActivityGate
 }
 
 var ritualsCurrent atomic.Pointer[ritualsRuntime]
@@ -144,7 +147,7 @@ func EnableRituals(opts RitualsOptions) (chi.Router, error) {
 	ritualsCurrent.Store(rt)
 	if rt.hub != nil {
 		rt.hub.SetSubscribeHook(rt.pendingRemovalFrames)
-		rt.hub.SetServerActivityHook(rt.touchSeatActivity)
+		rt.hub.SetServerActivityHook(rt.noteSeatActivity)
 	}
 	return rt.routes(opts.JWTSecret), nil
 }
