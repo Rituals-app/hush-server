@@ -39,10 +39,10 @@ type Client struct {
 
 // Run runs the read and write pumps. Call after Register. Blocks until connection closes.
 func (c *Client) Run() {
-	defer func() {
-		c.hub.Unregister(c)
-		_ = c.conn.Close()
-	}()
+	// Two defers, closed last: the socket closes even if Unregister panics
+	// (a presence send to a client whose send channel readPump closed).
+	defer func() { _ = c.conn.Close() }()
+	defer c.hub.Unregister(c)
 	go c.writePump()
 	c.readPump()
 }

@@ -221,12 +221,14 @@ var ritualsSchemaSQL = []string{
 	)`,
 	// The seat's last activity: set by every claim (new seat or re-open) and,
 	// throttled, when its Hush user's connection subscribes to the space's
-	// server, unsubscribes or disconnects (touchSeatActivity). The device cap
-	// retires the least recently active first (retireOldSeats). Nullable with
-	// no default and added here, not as a numbered migration, so the previous
-	// release still boots on this schema (dbcompat refuses a schema_migrations
-	// version past its own) and its inserts leave NULL. NULL means "never
-	// recorded": ranking falls back to the creation / device sign-in recency.
+	// server, unsubscribes or disconnects (noteSeatActivity). The device cap
+	// retires the least recently used first (retireOldSeats), ranking each
+	// seat by the latest of last_active_at, created_at and its device's
+	// sign-in times, so a fresh sign-in is never outranked by an old stamp.
+	// Nullable with no default and added here, not as a numbered migration,
+	// so the previous release still boots on this schema (dbcompat refuses a
+	// schema_migrations version past its own) and its inserts leave NULL,
+	// which the ranking skips (GREATEST ignores NULLs).
 	`ALTER TABLE rituals.seats ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ`,
 	`CREATE INDEX IF NOT EXISTS seats_sp_sub_idx ON rituals.seats (sp, sub)`,
 	`CREATE INDEX IF NOT EXISTS seats_user_id_idx ON rituals.seats (user_id)`,
