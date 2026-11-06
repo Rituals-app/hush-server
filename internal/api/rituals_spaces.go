@@ -70,6 +70,7 @@ type ritualsClaimResult struct {
 	metadata       []byte
 	selfSeated     bool
 	othersSeated   bool
+	personKey      string
 }
 
 // handleClaim: POST /api/rituals/spaces/claim {"ticket":"rt1..."} (RequireAuth).
@@ -135,7 +136,8 @@ func (rt *ritualsRuntime) claimSpace(ctx context.Context, userID string, t *ritu
 		return nil, nil, err
 	}
 
-	res := &ritualsClaimResult{level: models.PermissionLevelMember, metadata: plaintextMetadata(t.Name)}
+	res := &ritualsClaimResult{level: models.PermissionLevelMember, metadata: plaintextMetadata(t.Name),
+		personKey: rt.personKey(t.Sp, t.Sub)}
 	if t.Role == "owner" {
 		res.level = models.PermissionLevelAdmin
 	}
@@ -302,6 +304,16 @@ func ritualsCreateSpace(ctx context.Context, tx pgx.Tx, sp string, metadata []by
 	return serverID, nil
 }
 
+// ritualsJoinEventType is the system message for a new member row: a later
+// seat of a person already seated here is that person on a new device, not
+// a new member joining.
+func ritualsJoinEventType(res *ritualsClaimResult) string {
+	if res.selfSeated {
+		return "member_new_device"
+	}
+	return "member_joined"
+}
+
 // announceClaim sends the same frames as an invite claim when a member row
 // was inserted (invites.go), plus role and name changes.
 func (rt *ritualsRuntime) announceClaim(ctx context.Context, userID string, res *ritualsClaimResult) {
@@ -310,6 +322,9 @@ func (rt *ritualsRuntime) announceClaim(ctx context.Context, userID string, res 
 	}
 	if res.memberInserted {
 		member := map[string]interface{}{"id": userID, "permissionLevel": res.level}
+		if res.personKey != "" {
+			member["personKey"] = res.personKey
+		}
 		if u, err := rt.pool.GetUserByID(ctx, userID); err == nil && u != nil {
 			member["username"] = u.Username
 			member["displayName"] = u.DisplayName
@@ -321,7 +336,7 @@ func (rt *ritualsRuntime) announceClaim(ctx context.Context, userID string, res 
 		})
 		rt.hub.BroadcastToServer(res.serverID, msg)
 		rt.hub.BroadcastToUser(userID, msg)
-		EmitSystemMessage(ctx, rt.pool, rt.hub, res.serverID, "member_joined", userID, nil, "", nil)
+		EmitSystemMessage(ctx, rt.pool, rt.hub, res.serverID, ritualsJoinEventType(res), userID, nil, "", nil)
 	} else if res.levelRaised {
 		msg, _ := json.Marshal(map[string]interface{}{
 			"type":             "member_role_changed",

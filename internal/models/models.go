@@ -300,6 +300,8 @@ type ServerMemberWithUser struct {
 	PermissionLevel int       `json:"permissionLevel"`
 	JoinedAt        time.Time `json:"joinedAt"`
 	HomeInstance    *string   `json:"homeInstance,omitempty"` // nil = local, set = federated
+	// PersonKey (Rituals fork) groups the devices of one person in a Rituals space; absent elsewhere.
+	PersonKey string `json:"personKey,omitempty"`
 }
 
 // GuildBillingStats exposes guild infrastructure metrics to the instance operator.

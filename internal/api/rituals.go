@@ -70,6 +70,8 @@ type ritualsRuntime struct {
 	hub         RitualsHub
 	roomService livekit.RoomService
 	now         func() time.Time
+	// personSecret keys the per-Space person key (rituals_person.go).
+	personSecret []byte
 }
 
 var ritualsCurrent atomic.Pointer[ritualsRuntime]
@@ -129,6 +131,7 @@ func EnableRituals(opts RitualsOptions) (chi.Router, error) {
 		roomService: roomService,
 		now:         time.Now,
 	}
+	rt.personSecret = ritualsPersonKeySecret(opts.JWTSecret)
 	ritualsCurrent.Store(rt)
 	if rt.hub != nil {
 		rt.hub.SetSubscribeHook(rt.pendingRemovalFrames)
