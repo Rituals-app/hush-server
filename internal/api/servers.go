@@ -416,6 +416,7 @@ func (h *serversHandler) listMembers(w http.ResponseWriter, r *http.Request) {
 	if members == nil {
 		members = []models.ServerMemberWithUser{}
 	}
+	ritualsAnnotateMembers(r.Context(), serverID, members)
 	writeJSON(w, http.StatusOK, members)
 }
 
