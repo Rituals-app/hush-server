@@ -5,8 +5,9 @@ package api
 // read pump, or Run's deferred Unregister), so the hook never touches the
 // database there: an in-memory gate admits each (user, server) pair at most
 // once per ritualsSeatActivityThrottle into a bounded queue, and one
-// background drainer at a time writes the queue in batches. A failed write
-// is retried a bounded number of times.
+// background drainer at a time writes the queue in batches. A failed write,
+// and a seat row skipped because another transaction held it, are retried a
+// bounded number of times.
 
 import (
 	"context"
@@ -40,10 +41,11 @@ const (
 	// into a no-op inside the interval); when the queue is full an event is
 	// dropped without being remembered, so the pair's next event retries it.
 	ritualsSeatActivityMemo = 8192
-	// ritualsSeatActivityAttempts: a pair whose write fails is queued again
-	// after ritualsSeatActivityRetryDelay, for at most this many writes in
-	// all; then the gate forgets it, so its next event retries it. A
-	// disconnect is a session's last event, so without the retry one failed
+	// ritualsSeatActivityAttempts: a pair whose write fails, or whose seat
+	// row was skipped as locked, is queued again after
+	// ritualsSeatActivityRetryDelay, for at most this many writes in all;
+	// then the gate forgets it, so its next event retries it. A disconnect is
+	// a session's last event, so without the retry one failed or skipped
 	// write would leave the seat at its subscribe time.
 	ritualsSeatActivityAttempts   = 3
 	ritualsSeatActivityRetryDelay = 10 * time.Second
@@ -205,8 +207,9 @@ func (rt *ritualsRuntime) noteSeatActivity(userID string, serverIDs []string) {
 
 // drainSeatActivity writes queued pairs until the queue is empty, one batch
 // at a time, each bounded by ritualsSeatActivityTimeout. A failed batch is
-// logged and retried after the gate's delay, at most
-// ritualsSeatActivityAttempts writes per pair.
+// logged and retried after the gate's delay, and so are the pairs whose seat
+// row was skipped as locked; each pair gets at most
+// ritualsSeatActivityAttempts writes.
 func (rt *ritualsRuntime) drainSeatActivity() {
 	g := &rt.seatActivity
 	for {
@@ -220,12 +223,21 @@ func (rt *ritualsRuntime) drainSeatActivity() {
 			for i, tr := range batch {
 				pairs[i] = tr.ritualsSeatPair
 			}
-			err := rt.touchSeatActivityPairs(context.Background(), pairs)
-			if err == nil {
-				continue
+			skipped, err := rt.touchSeatActivityPairs(context.Background(), pairs)
+			var retry []ritualsSeatTry
+			switch {
+			case err != nil:
+				retry = g.failed(batch)
+				slog.Warn("rituals: seat activity", "err", err, "pairs", len(batch), "retrying", len(retry))
+			case len(skipped) > 0:
+				// Rows another transaction held: retried like a failed
+				// write, in case that transaction rolls back unstamped.
+				held := ritualsSeatTriesFor(batch, skipped)
+				retry = g.failed(held)
+				if n := len(held) - len(retry); n > 0 {
+					slog.Warn("rituals: seat activity: locked seats left unstamped", "pairs", n)
+				}
 			}
-			retry := g.failed(batch)
-			slog.Warn("rituals: seat activity", "err", err, "pairs", len(batch), "retrying", len(retry))
 			if len(retry) > 0 {
 				time.AfterFunc(g.delay(), func() {
 					if g.requeue(retry) {
@@ -250,7 +262,7 @@ func (rt *ritualsRuntime) touchSeatActivity(ctx context.Context, userID string, 
 	for _, id := range ids {
 		pairs = append(pairs, ritualsSeatPair{u.String(), id})
 	}
-	if err := rt.touchSeatActivityPairs(ctx, pairs); err != nil {
+	if _, err := rt.touchSeatActivityPairs(ctx, pairs); err != nil {
 		slog.Warn("rituals: seat activity", "err", err)
 	}
 }
@@ -264,12 +276,15 @@ func (rt *ritualsRuntime) touchSeatActivity(ctx context.Context, userID string, 
 // LOCKED): its holder is a claim, which stamps the seat itself, or a delete
 // (the device cap or a sync). So one busy row never stalls the batch, and
 // the write never waits on a lock held by a statement that could be waiting
-// on it, which rules out deadlocks with those multi-row deletes. The
-// transaction's statement_timeout ends a write blocked any other way (a
-// table lock) on the server too.
-func (rt *ritualsRuntime) touchSeatActivityPairs(ctx context.Context, pairs []ritualsSeatPair) error {
+// on it, which rules out deadlocks with those multi-row deletes. The pairs
+// of the due rows it did not stamp (skipped as locked, or changed since the
+// statement's snapshot) are returned, so the caller can try them again: the
+// holder may roll back without stamping, and a retry of a row the holder
+// stamped or deleted is a no-op. The transaction's statement_timeout ends a
+// write blocked any other way (a table lock) on the server too.
+func (rt *ritualsRuntime) touchSeatActivityPairs(ctx context.Context, pairs []ritualsSeatPair) ([]ritualsSeatPair, error) {
 	if rt.pool == nil {
-		return nil
+		return nil, nil
 	}
 	users := make([]string, 0, len(pairs))
 	servers := make([]string, 0, len(pairs))
@@ -284,22 +299,31 @@ func (rt *ritualsRuntime) touchSeatActivityPairs(ctx context.Context, pairs []ri
 		servers = append(servers, p.serverID)
 	}
 	if len(users) == 0 {
-		return nil
+		return nil, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, ritualsSeatActivityTimeout)
 	defer cancel()
 	tx, err := rt.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	if _, err := tx.Exec(ctx, `SELECT set_config('statement_timeout', $1, true)`,
 		strconv.FormatInt(ritualsSeatActivityStatementTimeout.Milliseconds(), 10)); err != nil {
-		return err
+		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `
+	// cand: the due rows as the snapshot sees them, unlocked. due: those this
+	// statement locked (the lock rechecks the throttle on the newest row
+	// version). cand rows missing from due were not stamped.
+	rows, err := tx.Query(ctx, `
 		WITH act AS (
 			SELECT * FROM unnest($1::uuid[], $2::uuid[]) AS a(user_id, server_id)
+		), cand AS (
+			SELECT s.sp, s.user_id, act.server_id
+			FROM rituals.seats s
+			JOIN rituals.spaces sp ON sp.sp = s.sp
+			JOIN act ON act.server_id = sp.server_id AND act.user_id = s.user_id
+			WHERE s.last_active_at IS NULL OR s.last_active_at < now() - make_interval(secs => $3)
 		), due AS (
 			SELECT s.sp, s.user_id
 			FROM rituals.seats s
@@ -308,14 +332,50 @@ func (rt *ritualsRuntime) touchSeatActivityPairs(ctx context.Context, pairs []ri
 			WHERE s.last_active_at IS NULL OR s.last_active_at < now() - make_interval(secs => $3)
 			ORDER BY s.sp, s.user_id
 			FOR NO KEY UPDATE OF s SKIP LOCKED
+		), stamped AS (
+			UPDATE rituals.seats s SET last_active_at = now()
+			FROM due
+			WHERE s.sp = due.sp AND s.user_id = due.user_id
 		)
-		UPDATE rituals.seats s SET last_active_at = now()
-		FROM due
-		WHERE s.sp = due.sp AND s.user_id = due.user_id`,
-		users, servers, ritualsSeatActivityThrottle.Seconds()); err != nil {
-		return err
+		SELECT cand.user_id::text, cand.server_id::text
+		FROM cand
+		WHERE NOT EXISTS (SELECT 1 FROM due WHERE due.sp = cand.sp AND due.user_id = cand.user_id)`,
+		users, servers, ritualsSeatActivityThrottle.Seconds())
+	if err != nil {
+		return nil, err
 	}
-	return tx.Commit(ctx)
+	var skipped []ritualsSeatPair
+	for rows.Next() {
+		var p ritualsSeatPair
+		if err := rows.Scan(&p.userID, &p.serverID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		skipped = append(skipped, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return skipped, nil
+}
+
+// ritualsSeatTriesFor returns the tries of batch whose pair is in pairs.
+func ritualsSeatTriesFor(batch []ritualsSeatTry, pairs []ritualsSeatPair) []ritualsSeatTry {
+	want := make(map[ritualsSeatPair]struct{}, len(pairs))
+	for _, p := range pairs {
+		want[p] = struct{}{}
+	}
+	out := make([]ritualsSeatTry, 0, len(pairs))
+	for _, tr := range batch {
+		if _, ok := want[tr.ritualsSeatPair]; ok {
+			out = append(out, tr)
+		}
+	}
+	return out
 }
 
 // ritualsValidUUIDs keeps the ids that parse as UUIDs, in canonical form

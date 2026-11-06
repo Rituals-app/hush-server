@@ -775,15 +775,17 @@ func TestRitualsSeatActivityQueueDB(t *testing.T) {
 		}
 	}
 
-	// A row lock: bob's seat is skipped, so alice's stamp lands at once, the
-	// drain ends well inside the statement timeout, and nothing is retried
-	// or left waiting to land when the lock goes.
+	// A row lock: bob's seat is skipped, so alice's stamp lands at once and
+	// the drain ends well inside the statement timeout. Bob's pair waits on
+	// a retry timer, and when the holder rolls back without stamping, the
+	// retry stamps it.
 	ritualsSeatAge(t, s, s.bob, time.Hour)
 	ritualsSeatAge(t, s, s.alice, time.Hour)
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback(ctx) //nolint:errcheck // a failed check must not leave the lock held
 	if _, err := tx.Exec(ctx, `SELECT 1 FROM rituals.seats WHERE sp = $1 AND user_id = $2 FOR UPDATE`, s.sp, s.bob); err != nil {
 		t.Fatal(err)
 	}
@@ -794,18 +796,43 @@ func TestRitualsSeatActivityQueueDB(t *testing.T) {
 	if took := time.Since(started); took >= ritualsSeatActivityStatementTimeout {
 		t.Fatalf("the drain waited on the row lock (%v)", took)
 	}
-	if _, _, r := state(); r != 0 {
-		t.Fatalf("a skipped row was retried (%d timers)", r)
+	if _, _, r := state(); r != 1 {
+		t.Fatalf("the skipped row is not waiting on a retry (%d timers)", r)
+	}
+	gate.mu.Lock()
+	_, bobPending := gate.pending[ritualsSeatPair{s.bob, s.serverID}]
+	_, bobSeen := gate.seen[ritualsSeatPair{s.bob, s.serverID}]
+	gate.mu.Unlock()
+	if bobPending || !bobSeen {
+		t.Fatalf("bob's retry state: pending %v, seen %v", bobPending, bobSeen)
 	}
 	if ago := ritualsLastActiveAgo(t, s, s.alice); ago < 0 || ago > 30*time.Second {
 		t.Fatalf("a locked row stalled the batch: alice not stamped (%v ago)", ago)
 	}
 	notStamped("row lock held", s.bob)
-	if err := tx.Commit(ctx); err != nil {
+	// Only the locked row is reported: a stamped row is not.
+	ritualsSeatAge(t, s, s.alice, time.Hour)
+	skipped, err := s.rt.touchSeatActivityPairs(ctx, []ritualsSeatPair{{s.alice, s.serverID}, {s.bob, s.serverID}})
+	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(200 * time.Millisecond)
-	notStamped("after the row lock", s.bob)
+	if len(skipped) != 1 || skipped[0] != (ritualsSeatPair{s.bob, s.serverID}) {
+		t.Fatalf("skipped = %v, want only bob's pair", skipped)
+	}
+	if ago := ritualsLastActiveAgo(t, s, s.alice); ago < 0 || ago > 30*time.Second {
+		t.Fatalf("direct write: alice not stamped (%v ago)", ago)
+	}
+	notStamped("direct write, row lock held", s.bob)
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	notStamped("rolled back, retry not due yet", s.bob)
+	waitFor(gate.retryDelay+2*time.Second, "retry of the skipped row", func() bool {
+		_, _, r := state()
+		ago := ritualsLastActiveAgo(t, s, s.bob)
+		return r == 0 && ago >= 0 && ago < 30*time.Second
+	})
+	ritualsWaitDrained(t, gate)
 
 	// A table lock blocks the write itself (FOR NO KEY UPDATE takes ROW
 	// SHARE, which EXCLUSIVE excludes; plain reads still pass). The gate
@@ -834,7 +861,7 @@ func TestRitualsSeatActivityQueueDB(t *testing.T) {
 	// The server cancels the blocked statement (57014, query_canceled)
 	// before the client's bound, so it is not left waiting to land.
 	started = time.Now()
-	err = s.rt.touchSeatActivityPairs(ctx, []ritualsSeatPair{{s.alice, s.serverID}})
+	_, err = s.rt.touchSeatActivityPairs(ctx, []ritualsSeatPair{{s.alice, s.serverID}})
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "57014" {
 		t.Fatalf("blocked write returned %v, want a server-side statement timeout", err)
@@ -1053,6 +1080,15 @@ func TestRitualsSeatActivityGate(t *testing.T) {
 	got := ritualsValidUUIDs([]string{strings.ToUpper(id), "{" + id + "}", "urn:uuid:" + id, "not-a-uuid", ""})
 	if strings.Join(got, ",") != id+","+id+","+id {
 		t.Fatalf("ritualsValidUUIDs = %v", got)
+	}
+	// Fix round 6: the skipped pairs of a batch keep their failure counts.
+	batch := []ritualsSeatTry{{ritualsSeatPair{"u", "a"}, 0}, {ritualsSeatPair{"u", "b"}, 1}, {ritualsSeatPair{"v", "a"}, 2}}
+	sub := ritualsSeatTriesFor(batch, []ritualsSeatPair{{"v", "a"}, {"u", "b"}, {"w", "z"}})
+	if len(sub) != 2 || sub[0] != batch[1] || sub[1] != batch[2] {
+		t.Fatalf("ritualsSeatTriesFor = %v", sub)
+	}
+	if len(ritualsSeatTriesFor(batch, nil)) != 0 {
+		t.Fatal("ritualsSeatTriesFor with no pairs is not empty")
 	}
 }
 
