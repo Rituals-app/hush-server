@@ -13,14 +13,18 @@ import (
 // Hub holds all connected clients, channel subscriptions, and guild subscriptions.
 type Hub struct {
 	mu       sync.RWMutex
-	clients  map[string]*Client              // clientID -> client
-	channels map[string]map[string]*Client   // channelID -> clientID -> client
-	servers  map[string]map[string]*Client   // serverID -> clientID -> client
-	presence map[string]struct{}             // userID -> present
+	clients  map[string]*Client            // clientID -> client
+	channels map[string]map[string]*Client // channelID -> clientID -> client
+	servers  map[string]map[string]*Client // serverID -> clientID -> client
+	presence map[string]struct{}           // userID -> present
 
 	// Rituals fork: called after an accepted channel subscribe; the frames
 	// it returns go to that client only (see SetSubscribeHook).
 	subscribeHook func(ctx context.Context, channelID, userID string) [][]byte
+	// Rituals fork: called outside h.mu after a local user's connection
+	// subscribes to, unsubscribes from or disconnects while subscribed to
+	// servers (see SetServerActivityHook).
+	serverActivityHook func(userID string, serverIDs []string)
 }
 
 // NewHub creates a new Hub.
@@ -51,12 +55,29 @@ func (h *Hub) Register(c *Client) {
 
 // Unregister removes a client and broadcasts presence update.
 // Only removes from presence if no other client shares the same identity.
+//
+// Rituals fork: the servers c was subscribed to are reported to the server
+// activity hook after the lock is released.
 func (h *Hub) Unregister(c *Client) {
+	if left, ok := h.unregister(c); ok {
+		h.noteServerActivity(c, left)
+	}
+}
+
+// unregister is Unregister under h.mu, released by defer so a panic in a
+// send (a peer whose send channel its read pump already closed) can never
+// leave the hub locked. It returns the servers c was subscribed to.
+func (h *Hub) unregister(c *Client) ([]string, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, ok := h.clients[c.id]; !ok {
-		return
+		return nil, false
 	}
+	left := make([]string, 0, len(c.servers))
+	for serverID := range c.servers {
+		left = append(left, serverID)
+	}
+	sort.Strings(left)
 	peers := h.serverPeersLocked(c)
 	delete(h.clients, c.id)
 	for _, m := range h.channels {
@@ -76,6 +97,7 @@ func (h *Hub) Unregister(c *Client) {
 	}
 	c.servers = nil
 	h.refreshPresenceLocked(peers)
+	return left, true
 }
 
 // hasOtherClientForUser returns true if any remaining client belongs to the given userID.
@@ -123,7 +145,16 @@ func (h *Hub) Unsubscribe(c *Client, channelID string) {
 }
 
 // SubscribeToServer adds the client to the server's subscriber set.
+// Rituals fork: then reports serverID to the server activity hook, outside
+// the lock.
 func (h *Hub) SubscribeToServer(c *Client, serverID string) {
+	h.subscribeToServer(c, serverID)
+	h.noteServerActivity(c, []string{serverID})
+}
+
+// subscribeToServer is SubscribeToServer under h.mu (released by defer, as in
+// unregister).
+func (h *Hub) subscribeToServer(c *Client, serverID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.servers[serverID] == nil {
@@ -138,15 +169,26 @@ func (h *Hub) SubscribeToServer(c *Client, serverID string) {
 }
 
 // UnsubscribeFromServer removes the client from the server's subscriber set.
+// Rituals fork: when c was subscribed, serverID then goes to the server
+// activity hook, outside the lock.
 func (h *Hub) UnsubscribeFromServer(c *Client, serverID string) {
+	if h.unsubscribeFromServer(c, serverID) {
+		h.noteServerActivity(c, []string{serverID})
+	}
+}
+
+// unsubscribeFromServer is UnsubscribeFromServer under h.mu (released by
+// defer, as in unregister); it reports whether c was subscribed.
+func (h *Hub) unsubscribeFromServer(c *Client, serverID string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, ok := h.servers[serverID][c.id]; !ok {
-		return
+		return false
 	}
 	affected := h.serverClientsLocked(serverID)
 	h.unsubscribeServerLocked(c, serverID)
 	h.refreshPresenceLocked(affected)
+	return true
 }
 
 // unsubscribeServerLocked drops c from serverID's set. Caller holds h.mu.
@@ -169,15 +211,22 @@ func (h *Hub) unsubscribeServerLocked(c *Client, serverID string) {
 // subscribed to serverID missed the member_kicked broadcast, so it gets the
 // same frame directly; a subscribed one already has it and gets nothing
 // twice. Presence is recomputed for everyone who shared the server.
-func (h *Hub) DisconnectUserFromServer(userID, serverID string, channelIDs []string) {
+// A non-empty reason is added to that direct frame as "reason", as in the
+// broadcast one (Rituals: "device_limit" for the device seat cap; a revoke
+// passes ""). This server-side removal is not reported as activity.
+func (h *Hub) DisconnectUserFromServer(userID, serverID string, channelIDs []string, reason string) {
 	if userID == "" || serverID == "" {
 		return
 	}
-	kicked, _ := json.Marshal(map[string]interface{}{
+	frame := map[string]interface{}{
 		"type":      "member_kicked",
 		"server_id": serverID,
 		"user_id":   userID,
-	})
+	}
+	if reason != "" {
+		frame["reason"] = reason
+	}
+	kicked, _ := json.Marshal(frame)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	affected := h.serverClientsLocked(serverID)
@@ -221,6 +270,36 @@ func (h *Hub) subscribeHookFn() func(ctx context.Context, channelID, userID stri
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.subscribeHook
+}
+
+// SetServerActivityHook installs fn, called with a local user's id and the
+// server ids involved after that user's connection subscribes to a server,
+// unsubscribes from one it was subscribed to, or unregisters while
+// subscribed to some. It runs on that connection's goroutine (its read pump,
+// or Run's deferred Unregister) after h.mu is released, never under it, so
+// fn must return at once: no I/O there (hand it off), and no call back into
+// the hub's write paths. Federated connections are not reported. Rituals
+// uses it to keep each device seat's last activity
+// (rituals.seats.last_active_at). nil removes it.
+func (h *Hub) SetServerActivityHook(fn func(userID string, serverIDs []string)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.serverActivityHook = fn
+}
+
+// noteServerActivity calls the server activity hook for c. Caller must not
+// hold h.mu.
+func (h *Hub) noteServerActivity(c *Client, serverIDs []string) {
+	if len(serverIDs) == 0 || c.userID == "" || c.federatedIdentityID != "" {
+		return
+	}
+	h.mu.RLock()
+	fn := h.serverActivityHook
+	h.mu.RUnlock()
+	if fn == nil {
+		return
+	}
+	fn(c.userID, serverIDs)
 }
 
 // BroadcastToServer sends the message to all clients subscribed to the given server.
@@ -394,8 +473,8 @@ func (h *Hub) DisconnectUser(userID string) {
 // HubStats is a point-in-time snapshot of Hub population counters used by
 // operator-facing metrics endpoints. All fields are non-negative.
 type HubStats struct {
-	Clients          int `json:"clients"`
-	PresentIdentities int `json:"presentIdentities"`
+	Clients            int `json:"clients"`
+	PresentIdentities  int `json:"presentIdentities"`
 	SubscribedChannels int `json:"subscribedChannels"`
 	SubscribedServers  int `json:"subscribedServers"`
 }
@@ -410,6 +489,22 @@ func (h *Hub) Stats() HubStats {
 		SubscribedChannels: len(h.channels),
 		SubscribedServers:  len(h.servers),
 	}
+}
+
+// ConnectedUsers reports which of userIDs (local users) have at least one
+// connection registered on this hub. Read lock only and no I/O, and no hub
+// path does database work under h.mu, so it is safe to call while a database
+// transaction is open (Rituals fork: the device seat cap, retireOldSeats).
+func (h *Hub) ConnectedUsers(userIDs []string) map[string]bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make(map[string]bool, len(userIDs))
+	for _, id := range userIDs {
+		if _, ok := h.presence[id]; ok {
+			out[id] = true
+		}
+	}
+	return out
 }
 
 // presenceKey is the identity a client contributes to presence.

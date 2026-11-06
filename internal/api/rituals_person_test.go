@@ -49,6 +49,12 @@ func TestRitualsPersonKey(t *testing.T) {
 type ritualsRecordingHub struct {
 	mu     sync.Mutex
 	frames []map[string]interface{}
+	// connected is the set of users ConnectedUsers reports as online.
+	connected map[string]bool
+	// disconnects records DisconnectUserFromServer calls as
+	// "user/server/reason"; activityHook is the installed activity hook.
+	disconnects  []string
+	activityHook func(string, []string)
 }
 
 func (h *ritualsRecordingHub) record(message []byte) {
@@ -58,14 +64,51 @@ func (h *ritualsRecordingHub) record(message []byte) {
 	h.frames = append(h.frames, m)
 	h.mu.Unlock()
 }
-func (h *ritualsRecordingHub) BroadcastToAll(message []byte)                     { h.record(message) }
-func (h *ritualsRecordingHub) BroadcastToServer(_ string, message []byte)        { h.record(message) }
-func (h *ritualsRecordingHub) BroadcastToUser(string, []byte)                    {}
-func (h *ritualsRecordingHub) DisconnectUser(string)                             {}
-func (h *ritualsRecordingHub) DisconnectDevice(string, string)                   {}
-func (h *ritualsRecordingHub) Broadcast(string, []byte, string)                  {}
-func (h *ritualsRecordingHub) DisconnectUserFromServer(string, string, []string) {}
+func (h *ritualsRecordingHub) BroadcastToAll(message []byte)              { h.record(message) }
+func (h *ritualsRecordingHub) BroadcastToServer(_ string, message []byte) { h.record(message) }
+func (h *ritualsRecordingHub) BroadcastToUser(string, []byte)             {}
+func (h *ritualsRecordingHub) DisconnectUser(string)                      {}
+func (h *ritualsRecordingHub) DisconnectDevice(string, string)            {}
+func (h *ritualsRecordingHub) Broadcast(string, []byte, string)           {}
+func (h *ritualsRecordingHub) DisconnectUserFromServer(userID, serverID string, _ []string, reason string) {
+	h.mu.Lock()
+	h.disconnects = append(h.disconnects, userID+"/"+serverID+"/"+reason)
+	h.mu.Unlock()
+}
 func (h *ritualsRecordingHub) SetSubscribeHook(func(context.Context, string, string) [][]byte) {
+}
+func (h *ritualsRecordingHub) SetServerActivityHook(fn func(string, []string)) {
+	h.mu.Lock()
+	h.activityHook = fn
+	h.mu.Unlock()
+}
+
+// takeDisconnects waits up to timeout for at least n recorded disconnects
+// (announceRemovals defers them by 500 ms) and returns and clears them.
+func (h *ritualsRecordingHub) takeDisconnects(n int, timeout time.Duration) []string {
+	deadline := time.Now().Add(timeout)
+	for {
+		h.mu.Lock()
+		if len(h.disconnects) >= n || time.Now().After(deadline) {
+			out := h.disconnects
+			h.disconnects = nil
+			h.mu.Unlock()
+			return out
+		}
+		h.mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+func (h *ritualsRecordingHub) ConnectedUsers(userIDs []string) map[string]bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := map[string]bool{}
+	for _, id := range userIDs {
+		if h.connected[id] {
+			out[id] = true
+		}
+	}
+	return out
 }
 
 func (h *ritualsRecordingHub) take() []map[string]interface{} {

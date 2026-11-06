@@ -47,10 +47,20 @@ type RitualsHub interface {
 	Broadcast(channelID string, message []byte, excludeClientID string)
 	// DisconnectUserFromServer drops a removed member from one server and
 	// its channels without closing sockets (wire contract Item 3, D18).
-	DisconnectUserFromServer(userID, serverID string, channelIDs []string)
+	// A non-empty reason goes into the direct member_kicked frame.
+	DisconnectUserFromServer(userID, serverID string, channelIDs []string, reason string)
 	// SetSubscribeHook installs the per-subscribe replay of pending MLS
 	// remove requests (wire contract Item 2, D15).
 	SetSubscribeHook(fn func(ctx context.Context, channelID, userID string) [][]byte)
+	// ConnectedUsers reports which users have a live WebSocket connection;
+	// the device seat cap never retires those first (retireOldSeats). Read
+	// lock only, no I/O: safe inside the claim transaction.
+	ConnectedUsers(userIDs []string) map[string]bool
+	// SetServerActivityHook installs the per-connection server activity
+	// callback (subscribe, unsubscribe, disconnect), called on the
+	// connection's goroutine outside the hub lock, so it must not block;
+	// Rituals keeps rituals.seats.last_active_at with it (rituals_activity.go).
+	SetServerActivityHook(fn func(userID string, serverIDs []string))
 }
 
 // RitualsOptions wires the Rituals Spaces runtime (see EnableRituals).
@@ -72,6 +82,8 @@ type ritualsRuntime struct {
 	now         func() time.Time
 	// personSecret keys the per-Space person key (rituals_person.go).
 	personSecret []byte
+	// seatActivity gates the hub's activity hook (rituals_activity.go).
+	seatActivity ritualsSeatActivityGate
 }
 
 var ritualsCurrent atomic.Pointer[ritualsRuntime]
@@ -135,6 +147,7 @@ func EnableRituals(opts RitualsOptions) (chi.Router, error) {
 	ritualsCurrent.Store(rt)
 	if rt.hub != nil {
 		rt.hub.SetSubscribeHook(rt.pendingRemovalFrames)
+		rt.hub.SetServerActivityHook(rt.noteSeatActivity)
 	}
 	return rt.routes(opts.JWTSecret), nil
 }
@@ -206,6 +219,17 @@ var ritualsSchemaSQL = []string{
 		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 		PRIMARY KEY (sp, user_id)
 	)`,
+	// The seat's last activity: set by every claim (new seat or re-open) and,
+	// throttled, when its Hush user's connection subscribes to the space's
+	// server, unsubscribes or disconnects (noteSeatActivity). The device cap
+	// retires the least recently used first (retireOldSeats), ranking each
+	// seat by the latest of last_active_at, created_at and its device's
+	// sign-in times, so a fresh sign-in is never outranked by an old stamp.
+	// Nullable with no default and added here, not as a numbered migration,
+	// so the previous release still boots on this schema (dbcompat refuses a
+	// schema_migrations version past its own) and its inserts leave NULL,
+	// which the ranking skips (GREATEST ignores NULLs).
+	`ALTER TABLE rituals.seats ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ`,
 	`CREATE INDEX IF NOT EXISTS seats_sp_sub_idx ON rituals.seats (sp, sub)`,
 	`CREATE INDEX IF NOT EXISTS seats_user_id_idx ON rituals.seats (user_id)`,
 	// user_id is SET NULL on user deletion so a consumed jti stays consumed.
@@ -220,7 +244,8 @@ var ritualsSchemaSQL = []string{
 	// deletion clears it. No FK on user_id: the leaf outlives a deleted user.
 	// The primary key serves the replay, hint and re-seat deletes; the
 	// created_at index serves the TTL delete. Bounded per sync by the 64
-	// device cap per user and the space's member and channel caps.
+	// device cap per user and the space's member rows (64 people x 5 device
+	// seats, member_cap_override) and channel caps.
 	`CREATE TABLE IF NOT EXISTS rituals.pending_mls_removals (
 		channel_id UUID        NOT NULL REFERENCES public.channels(id) ON DELETE CASCADE,
 		user_id    UUID        NOT NULL,

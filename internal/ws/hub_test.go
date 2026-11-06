@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -133,6 +134,27 @@ func TestHub_MultipleSessionsSameUser_PresenceRemovedOnFullDisconnect(t *testing
 	assert.Equal(t, []string{"observer"}, ids)
 }
 
+// Rituals fork: ConnectedUsers drives the device seat cap (retireOldSeats).
+func TestHub_ConnectedUsers(t *testing.T) {
+	hub := NewHub()
+	c1 := newTestClient(hub, "user-1")
+	c2 := newTestClient(hub, "user-1")
+	other := newTestClient(hub, "user-2")
+	hub.Register(c1)
+	hub.Register(c2)
+	hub.Register(other)
+
+	assert.Equal(t, map[string]bool{"user-1": true, "user-2": true},
+		hub.ConnectedUsers([]string{"user-1", "user-2", "user-3"}))
+
+	// Still connected through c2; gone once its last connection closes.
+	hub.Unregister(c1)
+	assert.Equal(t, map[string]bool{"user-1": true}, hub.ConnectedUsers([]string{"user-1"}))
+	hub.Unregister(c2)
+	assert.Empty(t, hub.ConnectedUsers([]string{"user-1"}))
+	assert.Empty(t, hub.ConnectedUsers(nil))
+}
+
 // presenceFrames returns the user_ids of every presence.update queued for c.
 func presenceFrames(t *testing.T, c *Client) [][]string {
 	t.Helper()
@@ -209,7 +231,7 @@ func TestHub_DisconnectUserFromServer(t *testing.T) {
 		_ = drainAllMessages(c, 50*time.Millisecond)
 	}
 
-	hub.DisconnectUserFromServer("bob", "space-1", []string{"text-1", "voice-1"})
+	hub.DisconnectUserFromServer("bob", "space-1", []string{"text-1", "voice-1"}, "")
 
 	// The subscribed connection already got member_kicked from the server
 	// broadcast; only the other one gets it directly.
@@ -224,6 +246,7 @@ func TestHub_DisconnectUserFromServer(t *testing.T) {
 	require.Len(t, kicked, 1)
 	assert.Equal(t, "space-1", kicked[0]["server_id"])
 	assert.Equal(t, "bob", kicked[0]["user_id"])
+	assert.NotContains(t, kicked[0], "reason", "an empty reason is left out")
 	for _, raw := range drainAllMessages(bobIn, 50*time.Millisecond) {
 		assert.NotContains(t, string(raw), "member_kicked")
 	}
@@ -250,6 +273,138 @@ func TestHub_DisconnectUserFromServer(t *testing.T) {
 	assert.Empty(t, drainAllMessages(bobIn, 50*time.Millisecond))
 	assert.Empty(t, drainAllMessages(bobOut, 50*time.Millisecond))
 	assert.Len(t, drainAllMessages(alice, 50*time.Millisecond), 2) // presence change + broadcast
+}
+
+// Rituals fork: a connection that was not subscribed to the server missed
+// the broadcast member_kicked, so the direct frame must carry the reason
+// (device_limit for the device seat cap) for the client to tell a retired
+// device from a removed person.
+func TestHub_DisconnectUserFromServer_ReasonToUnsubscribed(t *testing.T) {
+	hub := NewHub()
+	bobIn := newTestClient(hub, "bob")  // subscribed to space-1
+	bobOut := newTestClient(hub, "bob") // never opened space-1
+	hub.Register(bobIn)
+	hub.Register(bobOut)
+	hub.SubscribeToServer(bobIn, "space-1")
+	_ = drainAllMessages(bobIn, 50*time.Millisecond)
+	_ = drainAllMessages(bobOut, 50*time.Millisecond)
+
+	hub.DisconnectUserFromServer("bob", "space-1", nil, "device_limit")
+
+	var kicked []map[string]interface{}
+	for _, raw := range drainAllMessages(bobOut, 50*time.Millisecond) {
+		var m map[string]interface{}
+		require.NoError(t, json.Unmarshal(raw, &m))
+		if m["type"] == "member_kicked" {
+			kicked = append(kicked, m)
+		}
+	}
+	require.Len(t, kicked, 1)
+	assert.Equal(t, map[string]interface{}{
+		"type":      "member_kicked",
+		"server_id": "space-1",
+		"user_id":   "bob",
+		"reason":    "device_limit",
+	}, kicked[0])
+	for _, raw := range drainAllMessages(bobIn, 50*time.Millisecond) {
+		assert.NotContains(t, string(raw), "member_kicked", "the subscribed one had the broadcast")
+	}
+}
+
+// Rituals fork: the server activity hook sees subscribe, unsubscribe and
+// disconnect of a local user's connection, with the hub lock released, and
+// never a federated connection or a no-op unsubscribe.
+func TestHub_ServerActivityHook(t *testing.T) {
+	hub := NewHub()
+	alice := newTestClient(hub, "alice")
+	fed := NewClient(nil, hub, "", "fed-device", "fed-identity", nil)
+	hub.Register(alice)
+	hub.Register(fed)
+
+	var calls []string
+	unlocked := true
+	hub.SetServerActivityHook(func(userID string, serverIDs []string) {
+		if hub.mu.TryLock() {
+			hub.mu.Unlock()
+		} else {
+			unlocked = false
+		}
+		sorted := append([]string(nil), serverIDs...)
+		sort.Strings(sorted)
+		calls = append(calls, userID+":"+strings.Join(sorted, ","))
+	})
+
+	hub.SubscribeToServer(alice, "space-1")
+	hub.SubscribeToServer(alice, "space-2")
+	hub.UnsubscribeFromServer(alice, "space-1")
+	hub.UnsubscribeFromServer(alice, "space-1") // not subscribed: no call
+	hub.SubscribeToServer(alice, "space-3")
+	hub.SubscribeToServer(fed, "space-1")
+	hub.UnsubscribeFromServer(fed, "space-1")
+	hub.Unregister(fed)
+	hub.Unregister(alice)
+	hub.Unregister(alice) // already gone: no call
+
+	assert.Equal(t, []string{
+		"alice:space-1",
+		"alice:space-2",
+		"alice:space-1",
+		"alice:space-3",
+		"alice:space-2,space-3", // disconnect: every server it was on
+	}, calls)
+	assert.True(t, unlocked, "the hook must run outside h.mu")
+
+	// No servers at disconnect: nothing to report.
+	bob := newTestClient(hub, "bob")
+	hub.Register(bob)
+	hub.Unregister(bob)
+	assert.Len(t, calls, 5)
+
+	hub.SetServerActivityHook(nil)
+	carol := newTestClient(hub, "carol")
+	hub.Register(carol)
+	hub.SubscribeToServer(carol, "space-1")
+	hub.Unregister(carol)
+	assert.Len(t, calls, 5)
+}
+
+// Rituals fork: Subscribe, Unsubscribe and Unregister release h.mu by defer.
+// A peer whose read pump already closed its send channel (Client.readPump
+// closes it before Run's deferred Unregister) makes the presence refresh
+// panic; chi's Recoverer catches that, and the hub must not stay locked.
+func TestHub_LockReleasedWhenPresenceSendPanics(t *testing.T) {
+	cases := map[string]func(hub *Hub, alice *Client){
+		"subscribe":   func(hub *Hub, alice *Client) { hub.SubscribeToServer(alice, "space-1") },
+		"unsubscribe": func(hub *Hub, alice *Client) { hub.UnsubscribeFromServer(alice, "space-1") },
+		"unregister":  func(hub *Hub, alice *Client) { hub.Unregister(alice) },
+	}
+	for name, act := range cases {
+		t.Run(name, func(t *testing.T) {
+			hub := NewHub()
+			alice := newTestClient(hub, "alice")
+			bob := newTestClient(hub, "bob")
+			hub.Register(alice)
+			hub.Register(bob)
+			hooked := false
+			hub.SetServerActivityHook(func(string, []string) { hooked = true })
+			hub.SubscribeToServer(bob, "space-1")
+			if name != "subscribe" {
+				hub.SubscribeToServer(alice, "space-1")
+			}
+			hooked = false
+			close(bob.send) // bob's read pump has returned; Unregister not yet run
+
+			assert.Panics(t, func() { act(hub, alice) }, "the send to bob's closed channel panics")
+			require.True(t, hub.mu.TryLock(), "h.mu stayed locked after the panic")
+			hub.mu.Unlock()
+			assert.False(t, hooked, "no activity is reported for a call that panicked")
+			// The hub still serves other connections.
+			carol := newTestClient(hub, "carol")
+			hub.Register(carol)
+			hub.SubscribeToServer(carol, "space-2")
+			hub.Unregister(carol)
+		})
+	}
 }
 
 func TestHub_SubscribeHookReplaysToSubscriberOnly(t *testing.T) {
