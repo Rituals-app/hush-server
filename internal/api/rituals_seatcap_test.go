@@ -9,13 +9,14 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/hushhq/hush-server/internal/db"
 )
@@ -688,117 +689,201 @@ func TestRitualsSeatActivityTouchDB(t *testing.T) {
 	if rt == nil || rt == s.rt {
 		t.Fatal("EnableRituals did not build a new runtime")
 	}
-	defer ritualsWaitDrained(t, &rt.seatActivity)
+	gate := &rt.seatActivity
+	defer ritualsWaitDrained(t, gate)
 	hub.mu.Lock()
 	hook := hub.activityHook
 	hub.mu.Unlock()
 	if hook == nil {
 		t.Fatal("EnableRituals did not install the server activity hook")
 	}
+	// Each call returns at once: the hook only queues.
+	quick := func(uid string, ids []string) {
+		t.Helper()
+		started := time.Now()
+		hook(uid, ids)
+		if took := time.Since(started); took > 100*time.Millisecond {
+			t.Fatalf("the hook blocked for %v", took)
+		}
+	}
 	ritualsSeatAge(t, s, s.bob, time.Hour)
 	ritualsSeatAge(t, s, s.alice, time.Hour)
-	hook(s.bob, []string{s.serverID})
-	hook(s.alice, []string{"not-a-uuid", s.serverID})
-	hook("not-a-uuid", []string{s.serverID})
+	quick(s.bob, []string{s.serverID})
+	quick(s.alice, []string{"not-a-uuid", s.serverID})
+	quick("not-a-uuid", []string{s.serverID})
 	ritualsWaitStamped(t, s, s.bob)
 	ritualsWaitStamped(t, s, s.alice)
-	ritualsWaitDrained(t, &rt.seatActivity)
-	if pending := len(s.rt.seatActivity.pending); pending != 0 || s.rt.seatActivity.draining {
-		t.Fatalf("the hook queued into another runtime's gate (pending %d)", pending)
+	ritualsWaitDrained(t, gate)
+	// Fix round 5: ids are canonical gate keys, so another spelling of the
+	// same pair (upper case, braces) is throttled with it, not queued again.
+	gate.mu.Lock()
+	remembered := len(gate.seen)
+	gate.mu.Unlock()
+	quick(strings.ToUpper(s.bob), []string{"{" + strings.ToUpper(s.serverID) + "}"})
+	gate.mu.Lock()
+	_, same := gate.seen[ritualsSeatPair{s.bob, s.serverID}]
+	seen, pending := len(gate.seen), len(gate.pending)
+	gate.mu.Unlock()
+	if !same || seen != remembered || pending != 0 {
+		t.Fatalf("another spelling was a new pair (canonical key %v, seen %d -> %d, pending %d)", same, remembered, seen, pending)
 	}
 }
 
-// Fix round 4: the hook never waits on the database. A write held by a row
-// lock delays the stamp but loses nothing, events that arrive meanwhile
-// queue behind the one drainer, and a write that fails is retried by the
-// pair's next event instead of a throttle interval later.
+// Fix rounds 4 and 5: the hook never waits on the database. A seat row
+// another transaction holds is skipped, not waited on, so it never stalls
+// the batch. A write blocked any other way is cancelled on the server by the
+// statement timeout (so it cannot land later) and retried after the gate's
+// delay, and events that arrive meanwhile queue behind the one drainer.
 func TestRitualsSeatActivityQueueDB(t *testing.T) {
 	pool, cleanup := db.SetupTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
 	s := newRitualsTestSpace(t, pool) // alice (subA, owner) and bob (subB)
 	gate := &s.rt.seatActivity
+	gate.retryDelay = 3 * time.Second
 	defer ritualsWaitDrained(t, gate)
-	lockBob := func() pgx.Tx {
+	state := func() (pending int, draining bool, retrying int) {
+		gate.mu.Lock()
+		defer gate.mu.Unlock()
+		return len(gate.pending), gate.draining, gate.retrying
+	}
+	waitFor := func(within time.Duration, what string, ok func() bool) {
 		t.Helper()
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
+		deadline := time.Now().Add(within)
+		for !ok() {
+			if time.Now().After(deadline) {
+				p, d, r := state()
+				t.Fatalf("no %s within %v (pending %d, draining %v, retrying %d)", what, within, p, d, r)
+			}
+			time.Sleep(5 * time.Millisecond)
 		}
-		if _, err := tx.Exec(ctx, `SELECT 1 FROM rituals.seats WHERE sp = $1 AND user_id = $2 FOR UPDATE`, s.sp, s.bob); err != nil {
-			t.Fatal(err)
+	}
+	quick := func(uid string) {
+		t.Helper()
+		started := time.Now()
+		s.rt.noteSeatActivity(uid, []string{s.serverID})
+		if took := time.Since(started); took > 100*time.Millisecond {
+			t.Fatalf("the hook blocked for %v", took)
 		}
-		return tx
+	}
+	notStamped := func(when string, uids ...string) {
+		t.Helper()
+		for _, uid := range uids {
+			if ago := ritualsLastActiveAgo(t, s, uid); ago < 50*time.Minute {
+				t.Fatalf("%s: seat %s was stamped (%v ago)", when, uid, ago)
+			}
+		}
 	}
 
-	// Held by a row lock: the hook returns at once, nothing lands while the
-	// lock is held, and both stamps land once it goes.
+	// A row lock: bob's seat is skipped, so alice's stamp lands at once, the
+	// drain ends well inside the statement timeout, and nothing is retried
+	// or left waiting to land when the lock goes.
 	ritualsSeatAge(t, s, s.bob, time.Hour)
 	ritualsSeatAge(t, s, s.alice, time.Hour)
-	tx := lockBob()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM rituals.seats WHERE sp = $1 AND user_id = $2 FOR UPDATE`, s.sp, s.bob); err != nil {
+		t.Fatal(err)
+	}
 	started := time.Now()
-	s.rt.noteSeatActivity(s.bob, []string{s.serverID})
-	time.Sleep(50 * time.Millisecond) // let the drainer reach the lock
-	s.rt.noteSeatActivity(s.alice, []string{s.serverID})
-	if took := time.Since(started) - 50*time.Millisecond; took > 100*time.Millisecond {
-		t.Fatalf("the hook blocked for %v", took)
+	quick(s.bob)
+	quick(s.alice)
+	waitFor(time.Second, "drain past a locked row", func() bool { p, d, _ := state(); return p == 0 && !d })
+	if took := time.Since(started); took >= ritualsSeatActivityStatementTimeout {
+		t.Fatalf("the drain waited on the row lock (%v)", took)
 	}
-	time.Sleep(300 * time.Millisecond)
-	if ago := ritualsLastActiveAgo(t, s, s.bob); ago < 50*time.Minute {
-		t.Fatalf("written through a row lock (%v ago)", ago)
+	if _, _, r := state(); r != 0 {
+		t.Fatalf("a skipped row was retried (%d timers)", r)
 	}
-	gate.mu.Lock()
-	draining := gate.draining
-	gate.mu.Unlock()
-	if !draining {
-		t.Fatal("the drainer is not waiting on the lock")
+	if ago := ritualsLastActiveAgo(t, s, s.alice); ago < 0 || ago > 30*time.Second {
+		t.Fatalf("a locked row stalled the batch: alice not stamped (%v ago)", ago)
 	}
+	notStamped("row lock held", s.bob)
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	ritualsWaitStamped(t, s, s.bob)
-	ritualsWaitStamped(t, s, s.alice)
-	ritualsWaitDrained(t, gate)
+	time.Sleep(200 * time.Millisecond)
+	notStamped("after the row lock", s.bob)
 
-	// A write that times out is forgotten, so the next event retries it.
-	// (The gate starts over first: bob's pair was queued a moment ago.)
+	// A table lock blocks the write itself (FOR NO KEY UPDATE takes ROW
+	// SHARE, which EXCLUSIVE excludes; plain reads still pass). The gate
+	// starts over first: alice and bob were queued a moment ago.
 	gate.mu.Lock()
 	gate.seen = nil
 	gate.mu.Unlock()
-	ritualsSeatAge(t, s, s.bob, time.Hour)
-	tx = lockBob()
-	s.rt.noteSeatActivity(s.bob, []string{s.serverID})
-	ritualsWaitDrained(t, gate) // the 2 s write timeout ends the drain
-	gate.mu.Lock()
-	_, remembered := gate.seen[ritualsSeatPair{s.bob, s.serverID}]
-	gate.mu.Unlock()
+	users := []string{s.alice, s.bob}
+	for i := 0; i < 2; i++ {
+		a, b := s.user(t), s.user(t)
+		s.claim(t, a, s.subA, "member")
+		s.claim(t, b, s.subB, "member")
+		users = append(users, a, b)
+	}
+	for _, uid := range users {
+		ritualsSeatAge(t, s, uid, time.Hour)
+	}
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `LOCK TABLE rituals.seats IN EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	// The server cancels the blocked statement (57014, query_canceled)
+	// before the client's bound, so it is not left waiting to land.
+	started = time.Now()
+	err = s.rt.touchSeatActivityPairs(ctx, []ritualsSeatPair{{s.alice, s.serverID}})
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "57014" {
+		t.Fatalf("blocked write returned %v, want a server-side statement timeout", err)
+	}
+	if took := time.Since(started); took >= ritualsSeatActivityTimeout {
+		t.Fatalf("the statement timeout took %v", took)
+	}
+	notStamped("statement timed out", s.alice)
+	// Six people's events: the first one's write blocks, the other five
+	// queue behind the one drainer.
+	quick(users[0])
+	time.Sleep(100 * time.Millisecond)
+	for _, uid := range users[1:] {
+		quick(uid)
+	}
+	if p, d, _ := state(); p < len(users)-1 || !d {
+		t.Fatalf("events did not queue behind the blocked drainer (pending %d, draining %v)", p, d)
+	}
+	// Every write times out and waits on a retry timer; none lands.
+	waitFor(5*time.Second, "retry timer with the queue drained", func() bool {
+		p, d, r := state()
+		return p == 0 && !d && r >= 1
+	})
+	notStamped("table lock held", users...)
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if remembered {
-		t.Fatal("a failed pair stays throttled")
+	// The retries stamp every seat with no further events.
+	for _, uid := range users {
+		ritualsWaitStamped(t, s, uid)
 	}
-	if ago := ritualsLastActiveAgo(t, s, s.bob); ago < 50*time.Minute {
-		t.Fatalf("a timed-out write landed (%v ago)", ago)
-	}
-	s.rt.noteSeatActivity(s.bob, []string{s.serverID})
-	ritualsWaitStamped(t, s, s.bob)
+	ritualsWaitDrained(t, gate)
 }
 
-// ritualsWaitDrained waits for the gate's drainer to finish: nothing pending
-// and no drainer running, so no goroutine still touches the database.
+// ritualsWaitDrained waits for the gate to go idle: nothing pending, no
+// drainer running and no retry timer outstanding, so no goroutine will
+// touch the database after the test.
 func ritualsWaitDrained(t *testing.T, g *ritualsSeatActivityGate) {
 	t.Helper()
-	deadline := time.Now().Add(6 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for {
 		g.mu.Lock()
-		busy, pending := g.draining, len(g.pending)
+		busy, pending, retrying := g.draining, len(g.pending), g.retrying
 		g.mu.Unlock()
-		if !busy && pending == 0 {
+		if !busy && pending == 0 && retrying == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("seat activity drainer still running (%d pending)", pending)
+			t.Fatalf("seat activity still running (%d pending, draining %v, %d retry timers)", pending, busy, retrying)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -807,7 +892,7 @@ func ritualsWaitDrained(t *testing.T, g *ritualsSeatActivityGate) {
 // ritualsWaitStamped waits for the background activity write to stamp uid.
 func ritualsWaitStamped(t *testing.T, s *ritualsTestSpace, uid string) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(6 * time.Second)
 	for {
 		if ago := ritualsLastActiveAgo(t, s, uid); ago >= 0 && ago <= 30*time.Second {
 			return
@@ -819,17 +904,18 @@ func ritualsWaitStamped(t *testing.T, s *ritualsTestSpace, uid string) {
 	}
 }
 
-// ritualsPairs renders pairs sorted, for comparisons.
-func ritualsPairs(pairs []ritualsSeatPair) string {
-	out := make([]string, 0, len(pairs))
-	for _, p := range pairs {
-		out = append(out, p.userID+"/"+p.serverID)
+// ritualsPairs renders taken pairs sorted, for comparisons.
+func ritualsPairs(tries []ritualsSeatTry) string {
+	out := make([]string, 0, len(tries))
+	for _, tr := range tries {
+		out = append(out, tr.userID+"/"+tr.serverID)
 	}
 	sort.Strings(out)
 	return strings.Join(out, ",")
 }
 
-// Fix round 4: the in-memory gate and queue in front of the activity write.
+// Fix rounds 4 and 5: the in-memory gate and queue in front of the activity
+// write.
 func TestRitualsSeatActivityGate(t *testing.T) {
 	var g ritualsSeatActivityGate
 	now := time.Now()
@@ -871,16 +957,59 @@ func TestRitualsSeatActivityGate(t *testing.T) {
 	if g.take() != nil {
 		t.Fatal("the drain did not end")
 	}
-	// A forgotten (failed) pair is queued again at once.
-	if g.queue("u1", []string{"s2"}, now.Add(time.Second)) {
-		t.Fatal("a throttled pair started the drainer")
+
+	// Fix round 5: a failed write is retried. failed returns the pairs with
+	// attempts left and counts one retry timer; requeue puts them back and
+	// starts a drainer when none runs; after the last attempt the pair is
+	// forgotten, so its next event queues at once.
+	var r ritualsSeatActivityGate
+	p := ritualsSeatPair{"u1", "s1"}
+	r.queue(p.userID, []string{p.serverID}, now)
+	retry := r.failed(r.take())
+	if len(retry) != 1 || retry[0].failures != 1 || r.retrying != 1 {
+		t.Fatalf("first failure: %v, %d timers", retry, r.retrying)
 	}
-	g.forget([]ritualsSeatPair{{"u1", "s2"}})
-	if !g.queue("u1", []string{"s2"}, now.Add(2*time.Second)) {
-		t.Fatal("a forgotten pair was not queued")
+	if r.take() != nil || r.draining {
+		t.Fatal("the drain did not end while the retry waits")
 	}
-	g.take()
-	g.take()
+	if !r.requeue(retry) || r.retrying != 0 {
+		t.Fatalf("the retry did not start a drainer (%d timers)", r.retrying)
+	}
+	tries := r.take()
+	if len(tries) != 1 || tries[0].failures != 1 {
+		t.Fatalf("retried take: %v", tries)
+	}
+	retry = r.failed(tries)
+	if len(retry) != 1 || retry[0].failures != 2 {
+		t.Fatalf("second failure: %v", retry)
+	}
+	if r.requeue(retry) {
+		t.Fatal("a retry started a second drainer")
+	}
+	if retry = r.failed(r.take()); len(retry) != 0 || r.retrying != 0 {
+		t.Fatalf("retried past %d attempts: %v, %d timers", ritualsSeatActivityAttempts, retry, r.retrying)
+	}
+	if _, ok := r.seen[p]; ok {
+		t.Fatal("an exhausted pair stays throttled")
+	}
+	if r.queue(p.userID, []string{p.serverID}, now.Add(time.Second)); r.pending[p] != 0 || len(r.pending) != 1 {
+		t.Fatalf("an exhausted pair's next event: pending %v", r.pending)
+	}
+	r.take()
+	r.take()
+	// A retry meets a fresh event for the same pair: one entry, and the
+	// failures so far are kept.
+	r.queue(p.userID, []string{p.serverID}, now.Add(time.Minute+time.Second))
+	retry = r.failed(r.take())
+	r.take()
+	r.queue(p.userID, []string{p.serverID}, now.Add(3*time.Minute))
+	r.requeue(retry)
+	if len(r.pending) != 1 || r.pending[p] != 1 || r.retrying != 0 {
+		t.Fatalf("retry merge: pending %v, %d timers", r.pending, r.retrying)
+	}
+	r.take()
+	r.take()
+
 	// The queue is bounded: past ritualsSeatActivityMemo an event is dropped
 	// and not remembered, so its next event queues it.
 	ids := make([]string, ritualsSeatActivityMemo+1)
@@ -891,6 +1020,15 @@ func TestRitualsSeatActivityGate(t *testing.T) {
 	last := ritualsSeatPair{"w", ids[len(ids)-1]}
 	if _, ok := g.seen[last]; len(g.pending) != ritualsSeatActivityMemo || ok {
 		t.Fatalf("pending %d, dropped pair remembered %v", len(g.pending), ok)
+	}
+	// A retry that finds the queue full is dropped and forgotten too.
+	g.seen[p] = now
+	g.retrying = 1
+	if g.requeue([]ritualsSeatTry{{p, 1}}); len(g.pending) != ritualsSeatActivityMemo || g.retrying != 0 {
+		t.Fatalf("a retry overfilled the queue (pending %d, %d timers)", len(g.pending), g.retrying)
+	}
+	if _, ok := g.seen[p]; ok {
+		t.Fatal("a retry dropped from a full queue stays throttled")
 	}
 	if n := len(g.take()); n != ritualsSeatActivityMemo {
 		t.Fatalf("took %d", n)
@@ -909,6 +1047,12 @@ func TestRitualsSeatActivityGate(t *testing.T) {
 	m.queue("m", []string{"one-more"}, now)
 	if len(m.seen) != 1 {
 		t.Fatalf("memo size after overflow = %d, want 1", len(m.seen))
+	}
+	// Fix round 5: valid ids come back canonical, invalid ones are dropped.
+	const id = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	got := ritualsValidUUIDs([]string{strings.ToUpper(id), "{" + id + "}", "urn:uuid:" + id, "not-a-uuid", ""})
+	if strings.Join(got, ",") != id+","+id+","+id {
+		t.Fatalf("ritualsValidUUIDs = %v", got)
 	}
 }
 

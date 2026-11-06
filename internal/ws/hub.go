@@ -13,10 +13,10 @@ import (
 // Hub holds all connected clients, channel subscriptions, and guild subscriptions.
 type Hub struct {
 	mu       sync.RWMutex
-	clients  map[string]*Client              // clientID -> client
-	channels map[string]map[string]*Client   // channelID -> clientID -> client
-	servers  map[string]map[string]*Client   // serverID -> clientID -> client
-	presence map[string]struct{}             // userID -> present
+	clients  map[string]*Client            // clientID -> client
+	channels map[string]map[string]*Client // channelID -> clientID -> client
+	servers  map[string]map[string]*Client // serverID -> clientID -> client
+	presence map[string]struct{}           // userID -> present
 
 	// Rituals fork: called after an accepted channel subscribe; the frames
 	// it returns go to that client only (see SetSubscribeHook).
@@ -473,8 +473,8 @@ func (h *Hub) DisconnectUser(userID string) {
 // HubStats is a point-in-time snapshot of Hub population counters used by
 // operator-facing metrics endpoints. All fields are non-negative.
 type HubStats struct {
-	Clients          int `json:"clients"`
-	PresentIdentities int `json:"presentIdentities"`
+	Clients            int `json:"clients"`
+	PresentIdentities  int `json:"presentIdentities"`
 	SubscribedChannels int `json:"subscribedChannels"`
 	SubscribedServers  int `json:"subscribedServers"`
 }
