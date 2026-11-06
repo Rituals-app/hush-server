@@ -51,6 +51,10 @@ type RitualsHub interface {
 	// SetSubscribeHook installs the per-subscribe replay of pending MLS
 	// remove requests (wire contract Item 2, D15).
 	SetSubscribeHook(fn func(ctx context.Context, channelID, userID string) [][]byte)
+	// ConnectedUsers reports which users have a live WebSocket connection;
+	// the device seat cap never retires those first (retireOldSeats). Read
+	// lock only, no I/O: safe inside the claim transaction.
+	ConnectedUsers(userIDs []string) map[string]bool
 }
 
 // RitualsOptions wires the Rituals Spaces runtime (see EnableRituals).
@@ -220,7 +224,8 @@ var ritualsSchemaSQL = []string{
 	// deletion clears it. No FK on user_id: the leaf outlives a deleted user.
 	// The primary key serves the replay, hint and re-seat deletes; the
 	// created_at index serves the TTL delete. Bounded per sync by the 64
-	// device cap per user and the space's member and channel caps.
+	// device cap per user and the space's member rows (64 people x 5 device
+	// seats, member_cap_override) and channel caps.
 	`CREATE TABLE IF NOT EXISTS rituals.pending_mls_removals (
 		channel_id UUID        NOT NULL REFERENCES public.channels(id) ON DELETE CASCADE,
 		user_id    UUID        NOT NULL,

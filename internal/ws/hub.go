@@ -412,6 +412,22 @@ func (h *Hub) Stats() HubStats {
 	}
 }
 
+// ConnectedUsers reports which of userIDs (local users) have at least one
+// connection registered on this hub. Read lock only and no I/O, and no hub
+// path does database work under h.mu, so it is safe to call while a database
+// transaction is open (Rituals fork: the device seat cap, retireOldSeats).
+func (h *Hub) ConnectedUsers(userIDs []string) map[string]bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make(map[string]bool, len(userIDs))
+	for _, id := range userIDs {
+		if _, ok := h.presence[id]; ok {
+			out[id] = true
+		}
+	}
+	return out
+}
+
 // presenceKey is the identity a client contributes to presence.
 func presenceKey(c *Client) string {
 	if c.federatedIdentityID != "" {

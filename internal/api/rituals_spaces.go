@@ -28,9 +28,10 @@ const (
 	// without a seat counts once (rituals_spaces.go ritualsPeopleCount).
 	ritualsSpaceMemberCap = 64
 	// ritualsSeatsPerPerson is the most seats (devices) one person holds in
-	// one space. A claim for a further device retires that person's least
-	// recently active seat through the revoke path, so a storage-less browser
-	// opening the space again and again cannot fill it.
+	// one space. A claim for a further device retires one of that person's
+	// other seats through the revoke path (retireOldSeats: not a connected
+	// device, unfinished seats first, then the least recently active), so a
+	// storage-less browser opening the space again and again cannot fill it.
 	ritualsSeatsPerPerson = 5
 	// Namespace for the two-key pg_advisory_xact_lock(int4, int4) form ("RTS1").
 	ritualsAdvisoryClass  = int32(0x52545331)
@@ -38,6 +39,9 @@ const (
 	ritualsSyncBodyLimit  = 32 << 10
 	ritualsEffectsTimeout = 20 * time.Second
 	ritualsVoiceEvictWait = 4 * time.Second
+	// ritualsKickDeviceLimit is the member_kicked reason for a seat retired by
+	// the per-person device cap: the person is still in the space.
+	ritualsKickDeviceLimit = "device_limit"
 )
 
 // ritualsTemplate is the channel set of a new space: upstream's system
@@ -98,7 +102,7 @@ type ritualsClaimResult struct {
 // is true when someone else (a different sub) holds a seat, i.e. the space
 // has people in it already. Neither names anyone.
 // A new seat for a person who already holds ritualsSeatsPerPerson seats here
-// retires their least recently active seats first (retireOldSeats).
+// retires enough of their other seats first (retireOldSeats).
 // Before registering, the same hints come from POST /spaces/peek (rituals_peek.go),
 // where selfSeated means any seat for the sub, since no Hush user exists yet.
 // Errors {"error": code}: 400 bad_ticket,
@@ -312,13 +316,17 @@ func (rt *ritualsRuntime) claimSpace(ctx context.Context, userID string, t *ritu
 
 // ritualsCreateSpace creates the guild of a new space inside the claim
 // transaction, modelled on CreateDMGuild and the template channels of
-// createServer: closed, not discoverable, member cap 64, plaintext names.
+// createServer: closed, not discoverable, plaintext names. The claim enforces
+// the 64-person cap itself (ritualsPeopleCount); member_cap_override bounds
+// member rows, one per device, so it is 64 people x 5 device seats for the
+// upstream paths that compare it with the row count (invite and discoverable
+// joins).
 func ritualsCreateSpace(ctx context.Context, tx pgx.Tx, sp string, metadata []byte, iat int64) (string, error) {
 	var serverID string
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO servers (encrypted_metadata, access_policy, discoverable, member_cap_override)
 		VALUES ($1, 'closed', false, $2)
-		RETURNING id`, metadata, ritualsSpaceMemberCap).Scan(&serverID); err != nil {
+		RETURNING id`, metadata, ritualsSpaceMemberCap*ritualsSeatsPerPerson).Scan(&serverID); err != nil {
 		return "", fmt.Errorf("create space guild: %w", err)
 	}
 	for _, tc := range ritualsTemplate {
@@ -358,56 +366,95 @@ func ritualsPeopleCount(ctx context.Context, tx pgx.Tx, sp, serverID string) (in
 
 // retireOldSeats runs inside the claim transaction before a new seat for
 // (t.Sp, t.Sub) is inserted. When the person already holds
-// ritualsSeatsPerPerson or more seats here, it retires their least recently
-// active seats until the new one fits, never the claiming user, through the
+// ritualsSeatsPerPerson or more seats here, it retires just enough of their
+// other seats for the new one to fit, never the claiming user, through the
 // same per-user removal the revoke path uses (seat, member row, pending MLS
-// removals; the frames follow after commit in announceClaim). Activity is the
-// latest of the seat's creation and its Hush user's last device sign-in or
-// device registration (device_keys.last_seen, set on every challenge login;
-// devices.last_seen, set on credential upload), oldest first. An
-// in-use device retired here is dropped from the space like a revoke; its
-// next open from Rituals claims a seat again (same sub, not banned).
+// removals; the frames follow after commit in announceClaim, member_kicked
+// with reason "device_limit"). Its next open from Rituals claims a seat
+// again (same sub, not banned).
+//
+// Which seats go, in order:
+//  1. never a seat whose Hush user has a live WebSocket connection on this
+//     server's hub (a device in use right now);
+//  2. among the rest, first the seats that never finished joining or lost
+//     their membership: no server_members row, or no mls_credentials (a
+//     private window or a wiped account that registered and went away);
+//  3. then the least recently active: the latest of the seat's creation and
+//     its Hush user's last device sign-in or device registration
+//     (device_keys.last_seen, set on every challenge login; devices.last_seen,
+//     set on credential upload), oldest first.
+//
+// If not enough unconnected seats exist (every candidate is connected), the
+// rest come from the connected seats in the activity order of step 3: the cap
+// still holds, and those devices are dropped like a revoke. The hub is read
+// with ConnectedUsers (read lock, no I/O) while the advisory lock is held;
+// the hub is in-process, so only this API process's connections count.
 func (rt *ritualsRuntime) retireOldSeats(ctx context.Context, tx pgx.Tx, t *ritualsTicket, userID string, res *ritualsClaimResult) error {
-	var held int
-	if err := tx.QueryRow(ctx, `
-		SELECT COUNT(*) FROM rituals.seats WHERE sp = $1 AND sub = $2 AND user_id <> $3`,
-		t.Sp, t.Sub, userID).Scan(&held); err != nil {
-		return err
-	}
-	excess := held - (ritualsSeatsPerPerson - 1)
-	if excess <= 0 {
-		return nil
+	type seat struct {
+		uid  string
+		dead bool
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT s.user_id::text
+		SELECT s.user_id::text,
+		       NOT EXISTS (SELECT 1 FROM server_members sm WHERE sm.server_id = $4 AND sm.user_id = s.user_id)
+		         OR NOT EXISTS (SELECT 1 FROM mls_credentials mc WHERE mc.user_id = s.user_id)
 		FROM rituals.seats s
 		WHERE s.sp = $1 AND s.sub = $2 AND s.user_id <> $3
 		ORDER BY GREATEST(
 		           s.created_at,
 		           (SELECT MAX(dk.last_seen) FROM device_keys dk WHERE dk.user_id = s.user_id),
 		           (SELECT MAX(d.last_seen) FROM devices d WHERE d.user_id = s.user_id)),
-		         s.created_at, s.user_id
-		LIMIT $4`, t.Sp, t.Sub, userID, excess)
+		         s.created_at, s.user_id`, t.Sp, t.Sub, userID, res.serverID)
 	if err != nil {
 		return err
 	}
+	var held []seat
 	for rows.Next() {
-		var uid string
-		if err := rows.Scan(&uid); err != nil {
+		var c seat
+		if err := rows.Scan(&c.uid, &c.dead); err != nil {
 			rows.Close()
 			return err
 		}
-		res.retired = append(res.retired, uid)
+		held = append(held, c)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	excess := len(held) - (ritualsSeatsPerPerson - 1)
+	if excess <= 0 {
+		return nil
+	}
+	ids := make([]string, len(held))
+	for i, c := range held {
+		ids[i] = c.uid
+	}
+	connected := map[string]bool{}
+	if rt.hub != nil {
+		connected = rt.hub.ConnectedUsers(ids)
+	}
+	tiers := []func(seat) bool{
+		func(c seat) bool { return !connected[c.uid] && c.dead },
+		func(c seat) bool { return !connected[c.uid] && !c.dead },
+		func(c seat) bool { return connected[c.uid] }, // fallback: the cap must hold
+	}
+	var retired []string
+	for _, pick := range tiers {
+		for _, c := range held {
+			if len(retired) == excess {
+				break
+			}
+			if pick(c) {
+				retired = append(retired, c.uid)
+			}
+		}
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM rituals.seats WHERE sp = $1 AND user_id = ANY($2::uuid[])`,
-		t.Sp, res.retired); err != nil {
+		t.Sp, retired); err != nil {
 		return err
 	}
-	res.retiredMembers, err = ritualsDropMembers(ctx, tx, res.serverID, res.retired)
+	res.retired = retired
+	res.retiredMembers, err = ritualsDropMembers(ctx, tx, res.serverID, retired)
 	return err
 }
 
@@ -481,8 +528,9 @@ func ritualsJoinEventType(res *ritualsClaimResult) string {
 // was inserted (invites.go), plus role and name changes.
 func (rt *ritualsRuntime) announceClaim(ctx context.Context, userID string, res *ritualsClaimResult) {
 	// The person's retired older devices get the revoke effects. No timeline
-	// line: the person has not left, and this claim adds its own line.
-	rt.announceRemovals(res.serverID, res.retiredMembers, nil, res.textChannels, res.voiceChannels)
+	// line: the person has not left, and this claim adds its own line. The
+	// kick says why, so the device does not read it as losing the space.
+	rt.announceRemovals(res.serverID, res.retiredMembers, nil, ritualsKickDeviceLimit, res.textChannels, res.voiceChannels)
 	if rt.hub == nil {
 		return
 	}
@@ -723,7 +771,7 @@ func (rt *ritualsRuntime) announceSync(res *ritualsSyncResult) {
 	if res.renamed {
 		rt.broadcastRename(res.serverID, res.metadata)
 	}
-	rt.announceRemovals(res.serverID, res.removedMembers, res.leftActors, res.textChannels, res.voiceChannels)
+	rt.announceRemovals(res.serverID, res.removedMembers, res.leftActors, "", res.textChannels, res.voiceChannels)
 }
 
 // announceRemovals gives every removed member (one Hush user, i.e. one
@@ -733,7 +781,10 @@ func (rt *ritualsRuntime) announceSync(res *ritualsSyncResult) {
 // from any online member (best effort: nobody online means the leaf stays
 // until a later commit). leftActors get a "member_left" timeline line each:
 // the sync passes one device per removed person, the device cap passes none.
-func (rt *ritualsRuntime) announceRemovals(serverID string, removedMembers, leftActors, textChannels, voiceChannels []string) {
+// A non-empty kickReason is added to the member_kicked frame as "reason":
+// only the device cap sets one (ritualsKickDeviceLimit); a revoke sends
+// none, like before. Clients that do not know the reason show it as a kick.
+func (rt *ritualsRuntime) announceRemovals(serverID string, removedMembers, leftActors []string, kickReason string, textChannels, voiceChannels []string) {
 	if len(removedMembers) == 0 {
 		return
 	}
@@ -749,11 +800,15 @@ func (rt *ritualsRuntime) announceRemovals(serverID string, removedMembers, left
 		for _, uid := range removed {
 			// The WS frame is the kick frame so the device's clients drop the
 			// space like after a kick.
-			msg, _ := json.Marshal(map[string]interface{}{
+			frame := map[string]interface{}{
 				"type":      "member_kicked",
 				"server_id": serverID,
 				"user_id":   uid,
-			})
+			}
+			if kickReason != "" {
+				frame["reason"] = kickReason
+			}
+			msg, _ := json.Marshal(frame)
 			rt.hub.BroadcastToServer(serverID, msg)
 			rt.broadcastMLSRemovals(ctx, uid, textChannels)
 		}

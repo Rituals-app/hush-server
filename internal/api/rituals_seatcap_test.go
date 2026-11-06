@@ -176,7 +176,7 @@ func TestRitualsDeviceCapRetiresLeastRecentDB(t *testing.T) {
 	s.rt.announceClaim(ctx, sixth, res)
 	frames := hub.take()
 	kicked := ritualsFramesOfType(frames, "member_kicked")
-	if len(kicked) != 1 || kicked[0]["user_id"] != stale {
+	if len(kicked) != 1 || kicked[0]["user_id"] != stale || kicked[0]["reason"] != "device_limit" {
 		t.Fatalf("member_kicked frames = %v", kicked)
 	}
 	events, _ := ritualsSystemEvents(frames)
@@ -191,6 +191,111 @@ func TestRitualsDeviceCapRetiresLeastRecentDB(t *testing.T) {
 	res, cerr, err = s.rt.claimSpace(ctx, s.alice, ritualsTestTicket(t, s.priv, s.now, s.sp, s.subA, "owner"))
 	if err != nil || cerr != nil || len(res.retired) != 0 {
 		t.Fatalf("re-open: %+v %v %v", res, cerr, err)
+	}
+	// Bob is untouched throughout.
+	if got := ritualsSeatsOf(t, s, s.subB); len(got) != 1 || got[0] != s.bob || !ritualsIsMember(t, s, s.bob) {
+		t.Fatalf("bob seats = %v", got)
+	}
+}
+
+// ritualsClaimRetires claims a new device for sub and returns what it retired.
+func ritualsClaimRetires(t *testing.T, s *ritualsTestSpace, uid, sub string) *ritualsClaimResult {
+	t.Helper()
+	res, cerr, err := s.rt.claimSpace(context.Background(), uid, ritualsTestTicket(t, s.priv, s.now, s.sp, sub, "member"))
+	if err != nil || cerr != nil {
+		t.Fatalf("claim: %v %v", cerr, err)
+	}
+	if got := len(ritualsSeatsOf(t, s, sub)); got != ritualsSeatsPerPerson {
+		t.Fatalf("seats after claim = %d, want %d", got, ritualsSeatsPerPerson)
+	}
+	return res
+}
+
+// The device cap spares a device in use and retires seats that never
+// finished joining first: a private window or wiped account that registered
+// (no MLS credential) or lost its member row, then the least recently active
+// by devices.last_seen too; only when every other seat is connected does it
+// fall back to the activity order.
+func TestRitualsDeviceCapSparesConnectedDevicesDB(t *testing.T) {
+	pool, cleanup := db.SetupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	s := newRitualsTestSpace(t, pool) // alice (subA, owner) and bob (subB)
+	hub := &ritualsRecordingHub{connected: map[string]bool{}}
+	s.rt.hub = hub
+	s.rt.personSecret = ritualsPersonKeySecret("synthetic-jwt-secret-for-tests-only")
+	ritualsCurrent.Store(s.rt)
+	defer ritualsCurrent.Store(nil)
+
+	// Alice's daily laptop holds the oldest seat and is connected now, with no
+	// recent sign-in. d2 is a private window that registered and closed
+	// before uploading an MLS credential.
+	devices := []string{s.alice}
+	for i := 0; i < 4; i++ {
+		uid := s.user(t)
+		s.claim(t, uid, s.subA, "member")
+		devices = append(devices, uid)
+	}
+	alice, d1, d2, d3, d4 := devices[0], devices[1], devices[2], devices[3], devices[4]
+	for i, uid := range devices {
+		ritualsSeatAge(t, s, uid, time.Duration(50-i*10)*time.Minute)
+		if uid != d2 {
+			s.device(t, uid, "dev-"+uid[:8])
+		}
+	}
+	hub.connected[alice] = true
+	hub.take()
+
+	// 1. The unfinished seat goes, not the older connected laptop nor the
+	// older finished d1.
+	sixth := s.user(t)
+	res := ritualsClaimRetires(t, s, sixth, s.subA)
+	if len(res.retired) != 1 || res.retired[0] != d2 || len(res.retiredMembers) != 1 || res.retiredMembers[0] != d2 {
+		t.Fatalf("retired %v (members %v), want the unfinished seat %s", res.retired, res.retiredMembers, d2)
+	}
+	if !ritualsIsMember(t, s, alice) || !ritualsIsMember(t, s, d1) {
+		t.Fatal("a finished seat lost its member row")
+	}
+	s.rt.announceClaim(ctx, sixth, res)
+	kicked := ritualsFramesOfType(hub.take(), "member_kicked")
+	if len(kicked) != 1 || kicked[0]["user_id"] != d2 || kicked[0]["reason"] != "device_limit" {
+		t.Fatalf("member_kicked frames = %v", kicked)
+	}
+	s.device(t, sixth, "dev-"+sixth[:8])
+
+	// 2. A seat whose member row is gone (kicked in the frame) is unfinished
+	// too and goes before the least recently active d1.
+	if _, err := pool.Exec(ctx, `DELETE FROM server_members WHERE server_id = $1 AND user_id = $2`, s.serverID, d4); err != nil {
+		t.Fatal(err)
+	}
+	seventh := s.user(t)
+	res = ritualsClaimRetires(t, s, seventh, s.subA)
+	if len(res.retired) != 1 || res.retired[0] != d4 || len(res.retiredMembers) != 0 {
+		t.Fatalf("retired %v (members %v), want the seat without a member row %s", res.retired, res.retiredMembers, d4)
+	}
+	s.device(t, seventh, "dev-"+seventh[:8])
+
+	// 3. d1 registered a device a moment ago (devices.last_seen), so the least
+	// recently active unconnected seat is d3.
+	if err := pool.UpsertDevice(ctx, d1, "dev-"+d1[:8], ""); err != nil {
+		t.Fatal(err)
+	}
+	eighth := s.user(t)
+	res = ritualsClaimRetires(t, s, eighth, s.subA)
+	if len(res.retired) != 1 || res.retired[0] != d3 {
+		t.Fatalf("retired %v, want %s (d1 is recent by devices.last_seen)", res.retired, d3)
+	}
+	s.device(t, eighth, "dev-"+eighth[:8])
+
+	// 4. Every other seat is connected: the cap still holds, and the least
+	// recently active connected seat (the laptop) goes.
+	for _, uid := range ritualsSeatsOf(t, s, s.subA) {
+		hub.connected[uid] = true
+	}
+	ninth := s.user(t)
+	res = ritualsClaimRetires(t, s, ninth, s.subA)
+	if len(res.retired) != 1 || res.retired[0] != alice {
+		t.Fatalf("retired %v, want the least recently active %s", res.retired, alice)
 	}
 	// Bob is untouched throughout.
 	if got := ritualsSeatsOf(t, s, s.subB); len(got) != 1 || got[0] != s.bob || !ritualsIsMember(t, s, s.bob) {
@@ -364,8 +469,15 @@ func TestRitualsSyncOneLeftLinePerPersonDB(t *testing.T) {
 	}
 	s.rt.announceSync(res)
 	frames := hub.take()
-	if kicked := ritualsFramesOfType(frames, "member_kicked"); len(kicked) != 3 {
+	kicked := ritualsFramesOfType(frames, "member_kicked")
+	if len(kicked) != 3 {
 		t.Fatalf("member_kicked frames = %d, want one per device", len(kicked))
+	}
+	for _, f := range kicked {
+		// A revoke is a plain kick: no reason, unlike the device cap.
+		if _, ok := f["reason"]; ok {
+			t.Fatalf("revoke kick has a reason: %v", f)
+		}
 	}
 	events, actors := ritualsSystemEvents(frames)
 	if len(events) != 2 || events[0] != "member_left" || events[1] != "member_left" {

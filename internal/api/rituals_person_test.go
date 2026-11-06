@@ -49,6 +49,8 @@ func TestRitualsPersonKey(t *testing.T) {
 type ritualsRecordingHub struct {
 	mu     sync.Mutex
 	frames []map[string]interface{}
+	// connected is the set of users ConnectedUsers reports as online.
+	connected map[string]bool
 }
 
 func (h *ritualsRecordingHub) record(message []byte) {
@@ -66,6 +68,17 @@ func (h *ritualsRecordingHub) DisconnectDevice(string, string)                  
 func (h *ritualsRecordingHub) Broadcast(string, []byte, string)                  {}
 func (h *ritualsRecordingHub) DisconnectUserFromServer(string, string, []string) {}
 func (h *ritualsRecordingHub) SetSubscribeHook(func(context.Context, string, string) [][]byte) {
+}
+func (h *ritualsRecordingHub) ConnectedUsers(userIDs []string) map[string]bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := map[string]bool{}
+	for _, id := range userIDs {
+		if h.connected[id] {
+			out[id] = true
+		}
+	}
+	return out
 }
 
 func (h *ritualsRecordingHub) take() []map[string]interface{} {

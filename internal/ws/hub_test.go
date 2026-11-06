@@ -133,6 +133,27 @@ func TestHub_MultipleSessionsSameUser_PresenceRemovedOnFullDisconnect(t *testing
 	assert.Equal(t, []string{"observer"}, ids)
 }
 
+// Rituals fork: ConnectedUsers drives the device seat cap (retireOldSeats).
+func TestHub_ConnectedUsers(t *testing.T) {
+	hub := NewHub()
+	c1 := newTestClient(hub, "user-1")
+	c2 := newTestClient(hub, "user-1")
+	other := newTestClient(hub, "user-2")
+	hub.Register(c1)
+	hub.Register(c2)
+	hub.Register(other)
+
+	assert.Equal(t, map[string]bool{"user-1": true, "user-2": true},
+		hub.ConnectedUsers([]string{"user-1", "user-2", "user-3"}))
+
+	// Still connected through c2; gone once its last connection closes.
+	hub.Unregister(c1)
+	assert.Equal(t, map[string]bool{"user-1": true}, hub.ConnectedUsers([]string{"user-1"}))
+	hub.Unregister(c2)
+	assert.Empty(t, hub.ConnectedUsers([]string{"user-1"}))
+	assert.Empty(t, hub.ConnectedUsers(nil))
+}
+
 // presenceFrames returns the user_ids of every presence.update queued for c.
 func presenceFrames(t *testing.T, c *Client) [][]string {
 	t.Helper()
